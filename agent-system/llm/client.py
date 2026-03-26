@@ -4,6 +4,7 @@ LLM 客户端
 """
 import json
 import os
+from datetime import datetime
 from typing import List, Dict, Any, Optional, Generator
 from openai import OpenAI
 
@@ -12,6 +13,8 @@ from config.settings import config
 
 class LLMClient:
     """LLM 客户端"""
+
+    TRACE_MAX_CHARS = 4000
     
     def __init__(self, api_key: Optional[str] = None, 
                  base_url: Optional[str] = None,
@@ -45,7 +48,9 @@ class LLMClient:
     def chat(self, messages: List[Dict[str, str]], 
              temperature: Optional[float] = None,
              max_tokens: Optional[int] = None,
-             show_progress: bool = True) -> str:
+             show_progress: bool = True,
+             trace: Optional[List[Dict[str, Any]]] = None,
+             trace_meta: Optional[Dict[str, Any]] = None) -> str:
         """
         发送聊天请求
         
@@ -60,6 +65,17 @@ class LLMClient:
         """
         if show_progress:
             print(f"  [LLM] 正在调用 {self.model} 模型，请稍候...")
+
+        if trace is not None:
+            trace.append({
+                "type": "llm_request",
+                "ts": datetime.now().isoformat(),
+                "model": self.model,
+                "temperature": temperature or config.llm.temperature,
+                "max_tokens": max_tokens or config.llm.max_tokens,
+                "messages": self._truncate_messages(messages),
+                "meta": trace_meta or {},
+            })
         
         try:
             response = self.client.chat.completions.create(
@@ -71,12 +87,49 @@ class LLMClient:
             
             if show_progress:
                 print(f"  [LLM] 响应完成")
-            
-            return response.choices[0].message.content
+
+            content = response.choices[0].message.content
+            if trace is not None:
+                trace.append({
+                    "type": "llm_response",
+                    "ts": datetime.now().isoformat(),
+                    "model": self.model,
+                    "content": self._truncate_text(content),
+                    "meta": trace_meta or {},
+                })
+
+            return content
         except Exception as e:
             if show_progress:
                 print(f"  [LLM] 请求失败：{e}")
+
+            if trace is not None:
+                trace.append({
+                    "type": "llm_error",
+                    "ts": datetime.now().isoformat(),
+                    "model": self.model,
+                    "error": str(e),
+                    "meta": trace_meta or {},
+                })
             raise
+
+    def _truncate_text(self, text: str) -> str:
+        if text is None:
+            return ""
+        text = str(text)
+        if len(text) <= self.TRACE_MAX_CHARS:
+            return text
+        return text[: self.TRACE_MAX_CHARS] + "...<truncated>"
+
+    def _truncate_messages(self, messages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for m in messages:
+            out.append({
+                "role": m.get("role"),
+                "content": self._truncate_text(m.get("content", "")),
+                "content_len": len(m.get("content", "") or ""),
+            })
+        return out
     
     def chat_with_tools(self, messages: List[Dict[str, str]],
                         tools: List[Dict[str, Any]],

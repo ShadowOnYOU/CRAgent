@@ -53,7 +53,8 @@ class ReviewFilter:
         filtered = ReviewResult(
             pr_id=result.pr_id,
             summary=result.summary,
-            reasoning_trace=result.reasoning_trace
+            reasoning_trace=result.reasoning_trace,
+            run_trace=result.run_trace
         )
         
         # 严重级别映射
@@ -140,7 +141,8 @@ class ReviewFilter:
         
         filtered = ReviewResult(
             pr_id=result.pr_id,
-            reasoning_trace=result.reasoning_trace
+            reasoning_trace=result.reasoning_trace,
+            run_trace=result.run_trace
         )
         
         for i, issue in enumerate(result.issues, 1):

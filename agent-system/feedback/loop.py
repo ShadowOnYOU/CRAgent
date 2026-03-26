@@ -206,6 +206,7 @@ class FeedbackLoop:
                     for i in result.issues
                 ],
                 "reasoning_trace": result.reasoning_trace,
+                "run_trace": result.run_trace,
                 "timestamp": datetime.now().isoformat()
             }
             

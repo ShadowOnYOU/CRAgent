@@ -3,6 +3,7 @@ Long CoT 推理引擎
 实现 READ -> HYPOTHESIZE -> VERIFY -> CONCLUDE 推理循环
 """
 import json
+from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
 import sys
@@ -68,13 +69,23 @@ class LongCoTEngine:
             评审结果
         """
         self.trace = []
+        run_trace: List[Dict[str, Any]] = []
+        run_trace.append({
+            "type": "run_start",
+            "ts": datetime.now().isoformat(),
+            "engine": "LongCoT",
+            "model": getattr(self.llm_client, "model", None),
+            "pr_id": pr.pr_id,
+            "title": pr.title,
+            "changed_files": [c.file_path for c in pr.changes],
+        })
         
         # Step 1: READ
         self.trace.append("=" * 50)
         self.trace.append("Step 1: READ - 理解代码")
         self.trace.append("=" * 50)
         
-        read_result = self._read(pr)
+        read_result = self._read(pr, run_trace)
         self.trace.append(f"READ 结果：{json.dumps(read_result, ensure_ascii=False)[:500]}")
         
         # Step 2: HYPOTHESIZE
@@ -82,7 +93,7 @@ class LongCoTEngine:
         self.trace.append("Step 2: HYPOTHESIZE - 提出假设")
         self.trace.append("=" * 50)
         
-        hypotheses = self._hypothesize(pr, read_result)
+        hypotheses = self._hypothesize(pr, read_result, run_trace)
         self.trace.append(f"假设数量：{len(hypotheses)}")
         for i, h in enumerate(hypotheses, 1):
             self.trace.append(f"  {i}. {h}")
@@ -100,7 +111,7 @@ class LongCoTEngine:
                 self.trace.append("没有更多假设需要验证")
                 break
             
-            results, remaining_hypotheses = self._verify(pr, hypotheses)
+            results, remaining_hypotheses = self._verify(pr, hypotheses, run_trace)
             verification_results.extend(results)
             
             if not remaining_hypotheses:
@@ -117,12 +128,19 @@ class LongCoTEngine:
         self.trace.append("Step 4: CONCLUDE - 生成结论")
         self.trace.append("=" * 50)
         
-        result = self._conclude(pr, verification_results)
+        result = self._conclude(pr, verification_results, run_trace)
         result.reasoning_trace = self.trace.copy()
+        result.run_trace = run_trace
+        run_trace.append({
+            "type": "run_end",
+            "ts": datetime.now().isoformat(),
+            "issues": len(result.issues),
+            "summary": result.summary,
+        })
         
         return result
 
-    def _read(self, pr: PR) -> Dict[str, Any]:
+    def _read(self, pr: PR, run_trace: List[Dict[str, Any]]) -> Dict[str, Any]:
         """READ 阶段：理解代码"""
         # 构建代码变更摘要
         code_summary = self._build_code_summary(pr)
@@ -134,8 +152,13 @@ class LongCoTEngine:
             {"role": "system", "content": self.READ_SYSTEM},
             {"role": "user", "content": f"请分析以下代码变更：\n\n{code_summary}"}
         ]
-        
-        response = self.llm_client.chat(messages, show_progress=True)
+
+        response = self.llm_client.chat(
+            messages,
+            show_progress=True,
+            trace=run_trace,
+            trace_meta={"stage": "READ"},
+        )
         
         print(f"   ✅ 分析完成")
         print(f"   关键发现预览：{response[:200]}...")
@@ -146,7 +169,7 @@ class LongCoTEngine:
             "code_summary": code_summary
         }
 
-    def _hypothesize(self, pr: PR, read_result: Dict[str, Any]) -> List[str]:
+    def _hypothesize(self, pr: PR, read_result: Dict[str, Any], run_trace: List[Dict[str, Any]]) -> List[str]:
         """HYPOTHESIZE 阶段：提出假设"""
         print(f"\n💡 HYPOTHESIZE 阶段：提出缺陷假设")
         
@@ -163,7 +186,12 @@ class LongCoTEngine:
 请列出最多 5 个可验证的假设。"""}
         ]
         
-        response = self.llm_client.chat(messages, show_progress=True)
+        response = self.llm_client.chat(
+            messages,
+            show_progress=True,
+            trace=run_trace,
+            trace_meta={"stage": "HYPOTHESIZE"},
+        )
         
         # 提取假设（每行一个）
         hypotheses = []
@@ -183,7 +211,7 @@ class LongCoTEngine:
         
         return hypotheses[:5]
 
-    def _verify(self, pr: PR, hypotheses: List[str]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    def _verify(self, pr: PR, hypotheses: List[str], run_trace: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
         """VERIFY 阶段：验证假设"""
         print(f"\n🔍 VERIFY 阶段：验证 {len(hypotheses)} 个假设")
         
@@ -201,10 +229,26 @@ class LongCoTEngine:
             evidence = []
             for keyword in keywords[:3]:
                 print(f"     🔎 搜索 '{keyword}'...", end=" ")
-                tool_result = self.tool_agent.execute_tool(
-                    "code_search",
-                    {"pattern": keyword}
-                )
+
+                run_trace.append({
+                    "type": "tool_request",
+                    "ts": datetime.now().isoformat(),
+                    "tool": "code_search",
+                    "arguments": {"pattern": keyword},
+                    "meta": {"stage": "VERIFY", "hypothesis": hypothesis},
+                })
+
+                tool_result = self.tool_agent.execute_tool("code_search", {"pattern": keyword})
+
+                run_trace.append({
+                    "type": "tool_response",
+                    "ts": datetime.now().isoformat(),
+                    "tool": "code_search",
+                    "success": tool_result.success,
+                    "error": tool_result.error,
+                    "result": tool_result.result,
+                    "meta": {"stage": "VERIFY", "hypothesis": hypothesis},
+                })
                 
                 if tool_result.success and tool_result.result:
                     evidence.extend(tool_result.result[:2])
@@ -229,7 +273,7 @@ class LongCoTEngine:
         print(f"\n   📊 验证完成：{len(results)} 个已验证，{len(remaining)} 个待验证")
         return results, remaining
 
-    def _conclude(self, pr: PR, verification_results: List[Dict[str, Any]]) -> ReviewResult:
+    def _conclude(self, pr: PR, verification_results: List[Dict[str, Any]], run_trace: List[Dict[str, Any]]) -> ReviewResult:
         """CONCLUDE 阶段：生成结论"""
         print(f"\n📝 CONCLUDE 阶段：生成评审报告")
         
@@ -263,7 +307,12 @@ class LongCoTEngine:
 }}"""}
         ]
         
-        response = self.llm_client.chat(messages, show_progress=True)
+        response = self.llm_client.chat(
+            messages,
+            show_progress=True,
+            trace=run_trace,
+            trace_meta={"stage": "CONCLUDE"},
+        )
         
         # 解析响应
         result = self._parse_response(response, pr.pr_id)

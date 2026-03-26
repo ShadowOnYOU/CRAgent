@@ -1,6 +1,7 @@
 # Code Review Agent 依赖
+# 要求：Python 3.8+
 
-# LLM 客户端 - 使用 OpenAI 兼容 API（阿里云百炼）
+# OpenAI SDK (兼容阿里云百炼 API)
 openai>=1.0.0
 
 # 数据处理

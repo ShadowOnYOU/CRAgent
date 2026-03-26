@@ -54,6 +54,15 @@ class ASTParser:
     
     def __init__(self, root_path: str = "."):
         self.root_path = root_path
+
+    def parse(self, source: str) -> ast.Module:
+        """解析一段 Python 源码字符串并返回 AST。
+
+        主要用于单元测试/快速分析场景。
+        """
+        tree = ast.parse(source)
+        self._attach_parents(tree)
+        return tree
     
     def parse_file(self, file_path: str) -> Optional[ast.Module]:
         """
@@ -73,9 +82,17 @@ class ASTParser:
         try:
             with open(full_path, 'r', encoding='utf-8') as f:
                 source = f.read()
-            return ast.parse(source)
+            tree = ast.parse(source)
+            self._attach_parents(tree)
+            return tree
         except (SyntaxError, UnicodeDecodeError, Exception):
             return None
+
+    def _attach_parents(self, tree: ast.AST) -> None:
+        """给 AST 节点挂载 parent 指针，便于向上追溯封闭作用域。"""
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                setattr(child, 'parent', parent)
     
     def get_functions(self, file_path: str) -> List[FunctionInfo]:
         """

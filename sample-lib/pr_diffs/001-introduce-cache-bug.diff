@@ -1,0 +1,39 @@
+diff --git a/src/samplelib/lru.py b/src/samplelib/lru.py
+index 1111111..2222222 100644
+--- a/src/samplelib/lru.py
++++ b/src/samplelib/lru.py
+@@ -1,76 +1,93 @@
+ from __future__ import annotations
+ 
+ from collections import OrderedDict
+ from dataclasses import dataclass
+-from threading import RLock
++from threading import RLock
+ from typing import Callable, Generic, Optional, TypeVar
+ 
+ K = TypeVar("K")
+ V = TypeVar("V")
+@@
+ class LRUCache(Generic[K, V]):
+@@
+     def get_or_set(self, key: K, factory: Callable[[], V]) -> V:
+         """Get a cached value or create/store it."""
+-        existing = self.get(key)
+-        if existing is not None:
+-            return existing
+-
+-        value = factory()
+-        self.set(key, value)
+-        return value
++        # PR change: attempt to reduce lock contention by doing factory() outside the lock.
++        # NOTE: This introduces a race where factory() may be executed multiple times.
++        existing = self.get(key)
++        if existing is not None:
++            return existing
++
++        value = factory()
++
++        # Another thread could have inserted key between get() and here.
++        # We still overwrite and mark as most-recently-used.
++        self.set(key, value)
++        return value

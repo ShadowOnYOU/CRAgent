@@ -67,6 +67,7 @@ class ReviewResult:
     issues: List[ReviewIssue] = field(default_factory=list)
     summary: str = ""
     reasoning_trace: List[str] = field(default_factory=list)
+    run_trace: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass

@@ -240,6 +240,8 @@ def main():
         with open(args.output, 'w', encoding='utf-8') as f:
             json.dump({
                 "summary": result.summary,
+                "reasoning_trace": result.reasoning_trace,
+                "run_trace": result.run_trace,
                 "issues": [
                     {
                         "type": i.issue_type,
