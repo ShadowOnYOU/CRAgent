@@ -100,8 +100,9 @@ class ReviewFilter:
                 continue
             
             # 检查置信度
-            if issue.confidence < min_confidence:
-                continue
+            # 这边筛选的概率太高，暂时删除
+            # if issue.confidence < min_confidence:
+            #     continue
             
             # 检查是否为低价值问题
             if self._is_low_value(issue):
