@@ -106,7 +106,7 @@ python main.py --diff changes.diff --title "Fix bug in user module"
 
 ```bash
 # 不需要设置 DASHSCOPE_API_KEY
-/opt/anaconda3/envs/cragent/bin/python test_framework.py
+python test_framework.py
 ```
 
 2) **真实 LLM 的集成测试脚本**（会产生真实 API 调用；未设置 key 时默认跳过）
@@ -115,17 +115,17 @@ python main.py --diff changes.diff --title "Fix bug in user module"
 export DASHSCOPE_API_KEY=your_api_key_here
 
 # LLM 冒烟测试：验证 LLMClient 可调用且 JSON 可解析
-/opt/anaconda3/envs/cragent/bin/python test_llm_call.py
+python test_llm_call.py
 
 # 过滤器集成测试：真实调用 filter_with_llm，并验证 strict_facts 事实约束不会被破坏
-/opt/anaconda3/envs/cragent/bin/python test_llm_filter_integration.py
+python test_llm_filter_integration.py
 ```
 
 如需在 CI 中强制要求提供 key，可加 `--require-key`：
 
 ```bash
-/opt/anaconda3/envs/cragent/bin/python test_llm_call.py --require-key
-/opt/anaconda3/envs/cragent/bin/python test_llm_filter_integration.py --require-key
+python test_llm_call.py --require-key
+python test_llm_filter_integration.py --require-key
 ```
 
 ## 🆕 近期更新（更贴近“真实 code review”）
