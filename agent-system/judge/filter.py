@@ -2,13 +2,19 @@
 评审过滤器
 实现 LLM-as-Judge 过滤逻辑
 """
-from typing import List, Optional, Set
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import replace
+from typing import List, Optional, Set, Tuple
 
 import sys
 sys.path.insert(0, '.')
 
 from models import ReviewResult, ReviewIssue, RiskLevel
 from llm.client import LLMClient
+from models import PR
 
 
 class ReviewFilter:
@@ -27,7 +33,11 @@ class ReviewFilter:
 - 重复问题
 - 纯风格问题（除非严重影响可读性）"""
 
-    def __init__(self, llm_client: Optional[LLMClient] = None):
+    def __init__(
+        self,
+        llm_client: Optional[LLMClient] = None,
+        root_path: Optional[str] = None,
+    ):
         """
         初始化过滤器
         
@@ -35,10 +45,17 @@ class ReviewFilter:
             llm_client: LLM 客户端（可选，用于 LLM 过滤）
         """
         self.llm_client = llm_client
+        self.root_path = root_path
     
-    def filter(self, result: ReviewResult, 
-               min_severity: RiskLevel = RiskLevel.LOW,
-               min_confidence: float = 0.5) -> ReviewResult:
+    def filter(
+        self,
+        result: ReviewResult,
+        min_severity: RiskLevel = RiskLevel.LOW,
+        min_confidence: float = 0.5,
+        pr: Optional[PR] = None,
+        root_path: Optional[str] = None,
+        strict_facts: bool = False,
+    ) -> ReviewResult:
         """
         过滤评审结果
         
@@ -56,6 +73,8 @@ class ReviewFilter:
             reasoning_trace=result.reasoning_trace,
             run_trace=result.run_trace
         )
+
+        effective_root = root_path if root_path is not None else self.root_path
         
         # 严重级别映射
         severity_order = {
@@ -68,6 +87,13 @@ class ReviewFilter:
         min_sev_value = severity_order.get(min_severity, 0)
         
         for issue in result.issues:
+            # L3 事实校验与强约束：防止 file/line/evidence 幻觉
+            if strict_facts:
+                checked_issue = self._apply_fact_checks(issue, pr=pr, root_path=effective_root)
+                if checked_issue is None:
+                    continue
+                issue = checked_issue
+
             # 检查严重级别
             issue_sev_value = severity_order.get(issue.severity, 0)
             if issue_sev_value < min_sev_value:
@@ -95,7 +121,13 @@ class ReviewFilter:
         
         return filtered
     
-    def filter_with_llm(self, result: ReviewResult) -> ReviewResult:
+    def filter_with_llm(
+        self,
+        result: ReviewResult,
+        pr: Optional[PR] = None,
+        root_path: Optional[str] = None,
+        strict_facts: bool = False,
+    ) -> ReviewResult:
         """
         使用 LLM 进行智能过滤
         
@@ -106,7 +138,18 @@ class ReviewFilter:
             过滤后的结果
         """
         if not self.llm_client:
-            return self.filter(result)
+            return self.filter(result, pr=pr, root_path=root_path, strict_facts=strict_facts)
+
+        # 先做事实校验（可选），避免把“不可定位/无证据”提交给 LLM
+        if strict_facts:
+            result = self.filter(
+                result,
+                min_severity=RiskLevel.LOW,
+                min_confidence=0.0,
+                pr=pr,
+                root_path=root_path,
+                strict_facts=True,
+            )
         
         # 构建评审意见列表
         issues_text = ""
@@ -151,6 +194,171 @@ class ReviewFilter:
         
         filtered.summary = f"经过 LLM 评估，保留 {len(filtered.issues)} 个高价值问题"
         return filtered
+
+    def _apply_fact_checks(
+        self,
+        issue: ReviewIssue,
+        pr: Optional[PR],
+        root_path: Optional[str],
+    ) -> Optional[ReviewIssue]:
+        """对单条 issue 执行事实校验。
+
+        规则（严格模式）：
+        - file_path 非法/不可定位 -> 剔除
+        - line_number 非法/不可定位 -> 剔除
+        - evidence 为空或无法在文件/PR diff 中复现 -> 降级到低置信度（通常会被后续 min_confidence 剔除）
+        """
+        if not self._is_safe_relpath(issue.file_path):
+            return None
+
+        if issue.line_number <= 0:
+            return None
+
+        file_text = self._try_read_file(root_path, issue.file_path)
+
+        # 1) file/line 的“存在性与范围”校验
+        if file_text is not None:
+            if not self._is_line_in_file(file_text, issue.line_number):
+                return None
+        else:
+            # 文件不在磁盘上：允许退化到 PR diff 的 hunk 新文件行范围校验
+            if pr is not None:
+                change = self._find_change_for_file(pr, issue.file_path)
+                if change is None:
+                    return None
+
+                if not self._is_line_in_diff_hunks(change.diff, issue.line_number):
+                    # 能找到文件但无法定位到任何 hunk：降级而非立刻剔除
+                    issue = replace(issue, confidence=min(issue.confidence, 0.4))
+            else:
+                # 没有 PR 信息也无法读文件，无法验证行号
+                issue = replace(issue, confidence=min(issue.confidence, 0.4))
+
+        # 2) evidence 可复现校验
+        if not issue.evidence:
+            return replace(issue, confidence=0.0)
+
+        searchable_texts: List[str] = []
+        if file_text is not None:
+            searchable_texts.append(file_text)
+
+        if pr is not None:
+            change = self._find_change_for_file(pr, issue.file_path)
+            if change is not None:
+                searchable_texts.append(change.diff or "")
+                # parse_diff 生成的 new_content 对“无磁盘文件”的场景更友好
+                searchable_texts.append(change.new_content or "")
+
+        if not self._evidence_is_reproducible(issue.evidence, searchable_texts):
+            return replace(issue, confidence=min(issue.confidence, 0.3))
+
+        return issue
+
+    def _is_safe_relpath(self, path: str) -> bool:
+        if not path or not isinstance(path, str):
+            return False
+        if os.path.isabs(path):
+            return False
+        # 归一化后拒绝上跳路径
+        norm = os.path.normpath(path).replace("\\", "/")
+        if norm.startswith("../") or norm == "..":
+            return False
+        return True
+
+    def _try_read_file(self, root_path: Optional[str], file_path: str) -> Optional[str]:
+        if not root_path:
+            return None
+        try:
+            abs_root = os.path.abspath(root_path)
+            abs_file = os.path.abspath(os.path.join(abs_root, file_path))
+            # 防路径穿越
+            if os.path.commonpath([abs_root, abs_file]) != abs_root:
+                return None
+            if not os.path.isfile(abs_file):
+                return None
+            with open(abs_file, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read()
+        except Exception:
+            return None
+
+    def _is_line_in_file(self, file_text: str, line_number: int) -> bool:
+        if line_number <= 0:
+            return False
+        # splitlines() 不保留末尾空行；对行号范围校验够用
+        return line_number <= len(file_text.splitlines())
+
+    def _find_change_for_file(self, pr: PR, file_path: str):
+        for c in getattr(pr, "changes", []) or []:
+            if c.file_path == file_path:
+                return c
+        return None
+
+    def _is_line_in_diff_hunks(self, diff_text: str, line_number: int) -> bool:
+        """判断行号是否落在 unified diff 的任意一个 new-file hunk 范围内。"""
+        if not diff_text:
+            return False
+
+        # @@ -oldStart,oldCount +newStart,newCount @@
+        hunk_re = re.compile(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@", re.M)
+        for m in hunk_re.finditer(diff_text):
+            new_start = int(m.group(3))
+            new_count = int(m.group(4) or "1")
+            new_end = new_start + max(new_count, 0) - 1
+            if new_start <= line_number <= new_end:
+                return True
+        return False
+
+    def _normalize_for_search(self, text: str) -> str:
+        # 去掉常见包装，压缩空白
+        text = text.strip()
+        text = re.sub(r"^```[a-zA-Z0-9_+-]*\n|\n```$", "", text)
+        text = text.replace("\r\n", "\n")
+        text = re.sub(r"\s+", " ", text)
+        return text
+
+    def _extract_evidence_fragments(self, evidence: str) -> List[str]:
+        if not evidence:
+            return []
+        raw = evidence.strip()
+        if not raw:
+            return []
+
+        # 优先保留更像“代码行”的片段
+        lines = [ln.strip("\n") for ln in raw.splitlines()]
+        cleaned: List[str] = []
+        for ln in lines:
+            ln = ln.strip()
+            if not ln:
+                continue
+            # 去掉 diff/markdown 常见前缀
+            ln = ln.lstrip("+- ")
+            if len(ln) < 6:
+                continue
+            cleaned.append(ln)
+
+        cleaned.sort(key=len, reverse=True)
+        fragments = cleaned[:3]
+        # 兜底：若没有足够行，则用整体（归一化后）
+        if not fragments:
+            fragments = [raw]
+        return fragments
+
+    def _evidence_is_reproducible(self, evidence_list: List[str], searchable_texts: List[str]) -> bool:
+        if not searchable_texts:
+            return False
+
+        normalized_targets = [self._normalize_for_search(t) for t in searchable_texts if t]
+        if not normalized_targets:
+            return False
+
+        for ev in evidence_list:
+            for frag in self._extract_evidence_fragments(ev):
+                frag_n = self._normalize_for_search(frag)
+                if not frag_n:
+                    continue
+                if any(frag_n in target for target in normalized_targets):
+                    return True
+        return False
     
     def _is_low_value(self, issue: ReviewIssue) -> bool:
         """检查是否为低价值问题"""

@@ -77,7 +77,13 @@ class CodeReviewAgent:
         # 过滤
         if enable_filter:
             print("正在过滤低价值问题...")
-            result = self.review_filter.filter(result, min_severity=RiskLevel.LOW)
+            result = self.review_filter.filter(
+                result,
+                min_severity=RiskLevel.LOW,
+                pr=pr,
+                root_path=self.root_path,
+                strict_facts=True,
+            )
             print(f"过滤后剩余 {len(result.issues)} 个问题")
         
         # 保存结果

@@ -6,6 +6,7 @@
 """
 import os
 import sys
+import tempfile
 
 # 添加项目路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -244,6 +245,124 @@ def test_simple_review():
     
     return True
 
+
+def test_filter_fact_checks():
+    """测试过滤器的事实校验（L3 强约束）"""
+    print("=" * 50)
+    print("测试过滤器事实校验...\n")
+
+    from judge.filter import ReviewFilter
+    from models import PR, CodeChange, ReviewResult, ReviewIssue, RiskLevel
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        file_path = "a.py"
+        file_content = """def foo():
+    x = 1
+    return x
+"""
+
+        abs_file = os.path.join(tmpdir, file_path)
+        with open(abs_file, "w", encoding="utf-8") as f:
+            f.write(file_content)
+
+        diff = """diff --git a/a.py b/a.py
+index 0000000..1111111 100644
+--- a/a.py
++++ b/a.py
+@@ -0,0 +1,3 @@
++def foo():
++    x = 1
++    return x
+"""
+
+        pr = PR(
+            pr_id="FACT-001",
+            title="fact check",
+            changes=[
+                CodeChange(
+                    file_path=file_path,
+                    diff=diff,
+                    new_content=file_content,
+                    line_start=1,
+                    line_end=3,
+                )
+            ],
+        )
+
+        result = ReviewResult(
+            pr_id=pr.pr_id,
+            issues=[
+                # ✅ 合法：能定位到文件/行号且证据可复现
+                ReviewIssue(
+                    issue_type="逻辑错误",
+                    severity=RiskLevel.MEDIUM,
+                    message="return 行可能有问题",
+                    file_path=file_path,
+                    line_number=3,
+                    evidence=["return x"],
+                    confidence=0.9,
+                ),
+                # ❌ 非法：文件不存在
+                ReviewIssue(
+                    issue_type="空指针",
+                    severity=RiskLevel.HIGH,
+                    message="引用了不存在的文件",
+                    file_path="missing.py",
+                    line_number=1,
+                    evidence=["something"],
+                    confidence=0.9,
+                ),
+                # ❌ 非法：行号越界
+                ReviewIssue(
+                    issue_type="越界",
+                    severity=RiskLevel.HIGH,
+                    message="行号越界",
+                    file_path=file_path,
+                    line_number=999,
+                    evidence=["return x"],
+                    confidence=0.9,
+                ),
+                # ❌ 非法：无证据
+                ReviewIssue(
+                    issue_type="竞态",
+                    severity=RiskLevel.HIGH,
+                    message="没有证据的结论",
+                    file_path=file_path,
+                    line_number=2,
+                    evidence=[],
+                    confidence=0.9,
+                ),
+                # ❌ 非法：证据不可复现
+                ReviewIssue(
+                    issue_type="资源泄漏",
+                    severity=RiskLevel.HIGH,
+                    message="证据在文件/PR diff 中找不到",
+                    file_path=file_path,
+                    line_number=2,
+                    evidence=["definitely_not_in_file()"],
+                    confidence=0.9,
+                ),
+            ],
+            summary="fact test",
+        )
+
+        filter_obj = ReviewFilter(root_path=tmpdir)
+        filtered = filter_obj.filter(
+            result,
+            min_severity=RiskLevel.LOW,
+            min_confidence=0.5,
+            pr=pr,
+            root_path=tmpdir,
+            strict_facts=True,
+        )
+
+        assert len(filtered.issues) == 1, f"期望保留 1 条，实际 {len(filtered.issues)} 条"
+        assert filtered.issues[0].file_path == file_path
+        assert filtered.issues[0].line_number == 3
+
+    print("  ✅ 事实校验过滤通过：仅保留可定位且证据可复现的问题")
+    return True
+
 def main():
     """主函数"""
     print("\n" + "=" * 60)
@@ -255,6 +374,7 @@ def main():
         ("PR 解析器", test_pr_parser),
         ("工具模块", test_tools),
         ("过滤器", test_filter),
+        ("过滤器事实校验", test_filter_fact_checks),
         ("反馈模块", test_feedback),
         ("简单评审", test_simple_review),
     ]
