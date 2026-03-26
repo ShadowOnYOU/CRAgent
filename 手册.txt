@@ -1,0 +1,413 @@
+# 🧠 Code Review Agent 设计文档（工程实现版）
+
+## 一、总体设计目标
+
+构建一个面向代码评审（Code Review）的智能 Agent 系统，实现：
+
+* 自动理解 PR（代码变更）
+* 深度推理潜在缺陷（尤其是复杂逻辑 / 并发问题）
+* 输出**高价值、低误报**的评审意见
+* 通过反馈闭环持续优化模型能力
+
+核心理念：
+
+> ❗ 不做“浅层点评”，而是模拟“资深工程师的深度思考过程”
+
+---
+
+## 二、整体架构（3层 + 1闭环）
+
+```
+                ┌────────────────────┐
+                │   L1 上下文工程层   │
+                └────────┬───────────┘
+                         ↓
+                ┌────────────────────┐
+                │   L2 推理决策层     │
+                └────────┬───────────┘
+                         ↓
+                ┌────────────────────┐
+                │   L3 结果过滤层     │
+                └────────┬───────────┘
+                         ↓
+                ┌────────────────────┐
+                │   输出 + 数据闭环    │
+                └────────────────────┘
+```
+
+---
+
+## 三、L1：动态上下文工程层（Context Engine）
+
+### 🎯 目标
+
+构建“刚好够用”的上下文，而不是把所有信息塞给 LLM。
+
+---
+
+### 1️⃣ 输入数据（PR解析模块）
+
+```json
+{
+  "diff": "...",
+  "pr_title": "...",
+  "pr_description": "...",
+  "jira_ticket": "...",
+  "commit_history": [...]
+}
+```
+
+---
+
+### 2️⃣ 上下文召回模块
+
+#### （1）代码依赖分析
+
+* AST 静态分析
+* 调用链追踪（Caller / Callee）
+
+👉 技术实现建议：
+
+* Java：JavaParser / Spoon
+* Python：tree-sitter
+* C/C++：clang AST
+
+---
+
+#### （2）企业知识库（RAG）
+
+数据来源：
+
+* Confluence 文档
+* 历史缺陷案例
+* 编码规范（如 C/C++安全规范）
+
+👉 技术实现：
+
+* 向量库：FAISS / Milvus
+* Embedding：OpenAI / bge-large
+
+---
+
+#### （3）上下文筛选策略（核心）
+
+避免信息过载：
+
+```python
+def select_context(diff, candidates):
+    return [
+        ctx for ctx in candidates
+        if is_relevant(diff, ctx)
+    ]
+```
+
+策略包括：
+
+* 只保留相关文件
+* 只保留相关函数
+* 限制 token 数量
+
+---
+
+#### （4）自定义 Checklist
+
+支持业务规则：
+
+```json
+[
+  "禁止修改核心配置结构",
+  "必须判空",
+  "必须加锁"
+]
+```
+
+---
+
+### ✅ L1 输出
+
+```json
+{
+  "code_context": "...",
+  "docs_context": "...",
+  "checklist": [...]
+}
+```
+
+---
+
+## 四、L2：多 Agent 推理层（核心大脑）
+
+### 🎯 目标
+
+通过多个 Agent + 长思维链（Long CoT）实现“深度推理”
+
+---
+
+## 1️⃣ Agent 设计
+
+### （1）需求一致性 Agent
+
+判断：
+
+> 代码是否偏离 PR / Jira 的设计目标
+
+---
+
+### （2）缺陷识别 Agent（核心）
+
+基于：
+
+* 通用缺陷规则（死锁 / NPE / 内存泄漏）
+* 自定义 checklist
+
+---
+
+### （3）工具调用 Agent（Tool Agent）
+
+负责调用外部工具：
+
+```json
+[
+  "code_search",
+  "grep",
+  "find_references",
+  "read_file",
+  "ast_analysis"
+]
+```
+
+---
+
+## 2️⃣ Long CoT 推理引擎（关键设计）
+
+核心循环：
+
+```
+READ → HYPOTHESIZE → VERIFY → CONCLUDE
+```
+
+---
+
+### 🔹 Step 1: READ（理解代码）
+
+* 分析 diff
+* 识别关键变量 / 指针 / 状态
+
+---
+
+### 🔹 Step 2: HYPOTHESIZE（提出假设）
+
+例如：
+
+> 这个指针在并发场景下是否可能被释放？
+
+---
+
+### 🔹 Step 3: VERIFY（工具求证）
+
+自动调用工具：
+
+```python
+search("get_neighbor_from_table")
+find_references("free(neighbor)")
+```
+
+---
+
+### 🔹 Step 4: CONCLUDE（生成结论）
+
+输出必须包含：
+
+* ❗问题描述
+* 📍触发条件
+* 🔗证据链
+* 🛠 修复建议
+
+---
+
+### ✅ 示例输出结构
+
+```json
+{
+  "issue": "Use-After-Free",
+  "risk": "high",
+  "evidence": [
+    "get_neighbor_from_table 无锁",
+    "timer线程 free(neighbor)"
+  ],
+  "suggestion": "加锁或使用RCU"
+}
+```
+
+---
+
+## 五、L3：结果过滤层（LLM-as-Judge）
+
+### 🎯 目标
+
+只保留“高价值结论”，过滤噪音和幻觉
+
+---
+
+### 1️⃣ 事实校验（防幻觉）
+
+验证：
+
+* 变量是否存在
+* 代码路径是否真实
+
+---
+
+### 2️⃣ 去重与降噪
+
+* 去掉 lint 已报问题
+* 合并重复建议
+
+---
+
+### 3️⃣ 低价值过滤
+
+过滤：
+
+* “建议加注释”
+* “命名不规范”
+
+---
+
+### 4️⃣ 企业定制评估
+
+维度：
+
+* 技术正确性
+* 可执行性
+* 表达质量
+
+---
+
+### ✅ 输出结果
+
+```json
+{
+  "final_reviews": [
+    {
+      "severity": "critical",
+      "message": "...",
+      "evidence": "...",
+      "fix": "..."
+    }
+  ]
+}
+```
+
+---
+
+## 六、执行流程（Pipeline）
+
+```
+S1: PR解析
+S2: 上下文构建（L1）
+S3: 多Agent推理（L2）
+S4: 结果过滤（L3）
+S5: 输出评审
+```
+
+---
+
+## 七、反馈闭环（持续进化）
+
+### 🎯 三态反馈机制
+
+```text
+✅ Accept   → 正确
+⚠ Ignore   → 暂不处理
+❌ Reject   → 误报
+```
+
+---
+
+### 📊 数据飞轮
+
+1. 数据采集（Agent推理全过程）
+2. 构建评测集
+3. BadCase 修复
+4. A/B 测试迭代
+
+---
+
+### 🔁 自动隐式反馈
+
+> 用户没点“采纳”，但后续修复了代码 → 自动判定为有效
+
+---
+
+## 八、核心工程模块拆分（你可以直接这样写代码）
+
+```bash
+agent-system/
+├── ingestion/           # PR解析
+├── context_engine/      # L1
+├── agents/
+│   ├── consistency_agent.py
+│   ├── bug_agent.py
+│   └── tool_agent.py
+├── tools/
+│   ├── code_search.py
+│   ├── ast_parser.py
+│   └── grep.py
+├── reasoning/
+│   └── long_cot.py
+├── judge/
+│   └── filter.py
+├── feedback/
+│   └── loop.py
+└── api/
+    └── review_service.py
+```
+
+---
+
+## 九、关键设计亮点（面试/答辩可用）
+
+1. **动态上下文工程**
+
+   * 不喂全量 → 提高推理质量
+
+2. **Long CoT**
+
+   * 模拟专家思维（不是一次性输出）
+
+3. **工具增强推理（Tool-Augmented Reasoning）**
+
+   * 结论必须“带证据”
+
+4. **LLM-as-Judge**
+
+   * 二次过滤，降低误报
+
+5. **数据飞轮**
+
+   * 越用越准
+
+---
+
+## 十、如果你下一步要做实现（我建议你这样走）
+
+我可以继续帮你拆到更细（非常适合你现在做系统 + AI方向）：
+
+👉 下一步可以做：
+
+1. **先实现一个最小可用版本（MVP）**
+
+   * 单 Agent + 简单 CoT + code search
+
+2. 再加：
+
+   * 多 Agent
+   * Tool 调用
+   * Judge
+
+3. 最后加：
+
+   * 反馈闭环 + 微调
+
+---

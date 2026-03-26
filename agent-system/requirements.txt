@@ -1,0 +1,16 @@
+# Code Review Agent 依赖
+
+# LLM 客户端 - 使用 OpenAI 兼容 API（阿里云百炼）
+openai>=1.0.0
+
+# 数据处理
+requests>=2.28.0
+
+# 可选：向量数据库（用于 RAG 功能）
+# faiss-cpu>=1.7.0
+# chromadb>=0.4.0
+
+# 可选：开发工具
+# pytest>=7.0.0
+# black>=23.0.0
+# flake8>=6.0.0
