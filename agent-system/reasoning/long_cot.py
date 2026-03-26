@@ -5,6 +5,7 @@ Long CoT 推理引擎
 import json
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
+from collections import deque
 
 import sys
 sys.path.insert(0, '.')
@@ -353,112 +354,18 @@ class LongCoTEngine:
             # 提取关键词进行搜索
             keywords = self._extract_search_keywords(hypothesis, run_trace)
             print(f"   关键词：{', '.join(keywords[:3])}")
-            
-            evidence: List[Dict[str, Any]] = []
-            evidence_seen = set()
-            max_keywords_to_try = 3
-            max_evidence_items = 10
 
-            for keyword in keywords[:max_keywords_to_try]:
-                print(f"     🔎 搜索 '{keyword}'...", end=" ")
+            evidence, evaluation, mining_meta = self._mine_evidence_until_conclusion(
+                pr=pr,
+                hypothesis=hypothesis,
+                seed_keywords=keywords,
+                run_trace=run_trace,
+            )
 
-                run_trace.append({
-                    "type": "tool_request",
-                    "ts": datetime.now().isoformat(),
-                    "tool": "code_search",
-                    "arguments": {"pattern": keyword},
-                    "meta": {"stage": "VERIFY", "hypothesis": hypothesis},
-                })
-
-                tool_result = self.tool_agent.execute_tool("code_search", {"pattern": keyword})
-
-                run_trace.append({
-                    "type": "tool_response",
-                    "ts": datetime.now().isoformat(),
-                    "tool": "code_search",
-                    "success": tool_result.success,
-                    "error": tool_result.error,
-                    "result": tool_result.result,
-                    "meta": {"stage": "VERIFY", "hypothesis": hypothesis},
-                })
-                
-                if tool_result.success and tool_result.result:
-                    added_count = 0
-                    for item in tool_result.result[:10]:
-                        if not isinstance(item, dict):
-                            continue
-                        key = (item.get("file"), item.get("line"), item.get("content"))
-                        if key in evidence_seen:
-                            continue
-                        evidence_seen.add(key)
-                        evidence.append(item)
-                        added_count += 1
-                        if len(evidence) >= max_evidence_items:
-                            break
-
-                    print(f"✅ 找到 {len(tool_result.result)} 个结果 (+{added_count} 采样)")
-                    self.trace.append(
-                        f"  搜索 '{keyword}': 找到 {len(tool_result.result)} 个结果，采样 {added_count} 条证据"
-                    )
-
-                    if len(evidence) >= max_evidence_items:
-                        break
-                else:
-                    print("❌ 无结果")
-
-            # 将“单行命中”升级为“函数级上下文”（只 enrich 前几条，避免爆 prompt）
-            max_scopes_to_attach = 3
-            for item in evidence[:max_scopes_to_attach]:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("scope") is not None:
-                    continue
-                file_path = item.get("file")
-                line_no = item.get("line")
-                if not file_path or not line_no:
-                    continue
-
-                run_trace.append({
-                    "type": "tool_request",
-                    "ts": datetime.now().isoformat(),
-                    "tool": "get_function_context",
-                    "arguments": {"file_path": file_path, "line_number": line_no},
-                    "meta": {"stage": "VERIFY", "hypothesis": hypothesis},
-                })
-
-                ctx_result = self.tool_agent.execute_tool(
-                    "get_function_context",
-                    {"file_path": file_path, "line_number": line_no},
-                )
-
-                run_trace.append({
-                    "type": "tool_response",
-                    "ts": datetime.now().isoformat(),
-                    "tool": "get_function_context",
-                    "success": ctx_result.success,
-                    "error": ctx_result.error,
-                    "result": ctx_result.result,
-                    "meta": {"stage": "VERIFY", "hypothesis": hypothesis},
-                })
-
-                if ctx_result.success and ctx_result.result:
-                    item["scope"] = ctx_result.result
-            
             if not evidence:
                 remaining.append(hypothesis)
                 print(f"   ⏸️ 未找到直接证据，留待下一轮")
                 continue
-
-            # 用证据内容做一次“确认/推翻/不确定”的判定
-            try:
-                evaluation = self._evaluate_hypothesis_with_evidence(hypothesis, evidence, run_trace)
-            except Exception as e:
-                evaluation = {
-                    "status": "inconclusive",
-                    "confidence": 0.0,
-                    "reason": f"LLM verification error: {e}",
-                    "next_keywords": [],
-                }
 
             status = str(evaluation.get("status", "inconclusive"))
             if status == "confirmed":
@@ -478,6 +385,11 @@ class LongCoTEngine:
                 print(f"   ⏸️ 证据不足，保留到下一轮")
                 self.trace.append(f"  验证结论：inconclusive | {evaluation.get('reason', '')}")
 
+                if isinstance(mining_meta, dict):
+                    self.trace.append(
+                        f"  深挖统计：depth={mining_meta.get('max_depth_reached')} tool_calls={mining_meta.get('tool_calls')} evidence={mining_meta.get('evidence_items')}"
+                    )
+
                 nk = evaluation.get("next_keywords")
                 if isinstance(nk, list) and nk:
                     prev = self._keyword_cache.get(hypothesis, keywords)
@@ -496,6 +408,336 @@ class LongCoTEngine:
         
         print(f"\n   📊 验证完成：{len(results)} 个已验证，{len(remaining)} 个待验证")
         return results, remaining
+
+    def _mine_evidence_until_conclusion(
+        self,
+        pr: PR,
+        hypothesis: str,
+        seed_keywords: List[str],
+        run_trace: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+        """在给定预算内递归挖掘证据，直到得出结论或达到上限。
+
+        挖掘策略（简化版调用链/引用链）：
+        1) keyword -> code_search
+        2) 从命中行/函数片段中抽取候选符号
+        3) symbol -> find_function / find_references，并对关键命中附加 get_function_context
+        4) 在 inconclusive 时使用 next_keywords 扩展下一轮 keyword
+
+        上限控制：最大深度 / 最大工具调用次数 / 最大证据条数。
+        """
+        max_depth = 2
+        max_tool_calls = 14
+        max_evidence_items = 15
+        max_scopes_to_attach = 5
+        max_symbols_to_follow = 8
+
+        evidence: List[Dict[str, Any]] = []
+        evidence_seen = set()
+        tool_calls = 0
+        max_depth_reached = 0
+
+        # 任务队列：BFS，避免一条链挖太深
+        tasks = deque()
+        task_seen = set()
+        for kw in (seed_keywords or [])[:8]:
+            kw = self._clean_keyword(kw)
+            if not kw:
+                continue
+            key = ("keyword", kw)
+            if key in task_seen:
+                continue
+            task_seen.add(key)
+            tasks.append({"type": "keyword", "value": kw, "depth": 0})
+
+        def add_evidence_items(items: Any, limit: int = 10) -> int:
+            nonlocal evidence
+            added = 0
+            if not isinstance(items, list):
+                return 0
+            for item in items[:limit]:
+                if not isinstance(item, dict):
+                    continue
+                key = (item.get("file"), item.get("line"), item.get("content"))
+                if key in evidence_seen:
+                    continue
+                evidence_seen.add(key)
+                evidence.append(item)
+                added += 1
+                if len(evidence) >= max_evidence_items:
+                    break
+            return added
+
+        def trace_tool(tool: str, arguments: Dict[str, Any], result_obj: Any, stage: str = "VERIFY"):
+            run_trace.append({
+                "type": "tool_request",
+                "ts": datetime.now().isoformat(),
+                "tool": tool,
+                "arguments": arguments,
+                "meta": {"stage": stage, "hypothesis": hypothesis},
+            })
+            run_trace.append({
+                "type": "tool_response",
+                "ts": datetime.now().isoformat(),
+                "tool": tool,
+                "success": getattr(result_obj, "success", False),
+                "error": getattr(result_obj, "error", None),
+                "result": getattr(result_obj, "result", None),
+                "meta": {"stage": stage, "hypothesis": hypothesis},
+            })
+
+        def attach_scope(item: Dict[str, Any]) -> bool:
+            nonlocal tool_calls
+            if tool_calls >= max_tool_calls:
+                return False
+            if not isinstance(item, dict) or item.get("scope") is not None:
+                return False
+            file_path = item.get("file")
+            line_no = item.get("line")
+            if not file_path or not line_no:
+                return False
+
+            args = {"file_path": file_path, "line_number": line_no}
+            run_trace.append({
+                "type": "tool_request",
+                "ts": datetime.now().isoformat(),
+                "tool": "get_function_context",
+                "arguments": args,
+                "meta": {"stage": "VERIFY", "hypothesis": hypothesis},
+            })
+            ctx_result = self.tool_agent.execute_tool("get_function_context", args)
+            tool_calls += 1
+            run_trace.append({
+                "type": "tool_response",
+                "ts": datetime.now().isoformat(),
+                "tool": "get_function_context",
+                "success": ctx_result.success,
+                "error": ctx_result.error,
+                "result": ctx_result.result,
+                "meta": {"stage": "VERIFY", "hypothesis": hypothesis},
+            })
+            if ctx_result.success and ctx_result.result:
+                item["scope"] = ctx_result.result
+                return True
+            return False
+
+        def extract_symbols_from_text(text: str) -> List[str]:
+            import re
+
+            if not text:
+                return []
+
+            candidates: List[str] = []
+
+            # def/class 名
+            candidates.extend(re.findall(r"\bdef\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", text))
+            candidates.extend(re.findall(r"\bclass\s+([a-zA-Z_][a-zA-Z0-9_]*)\b", text))
+
+            # dotted 名称（module.func / obj.method）
+            candidates.extend(re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)+\b", text))
+
+            # 函数调用形态：foo(
+            call_names = re.findall(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", text)
+            # 过滤明显的关键字/噪声
+            noise = {
+                "if", "for", "while", "return", "print", "len", "int", "str", "dict", "list", "set",
+                "min", "max", "sum", "range", "open", "join", "append", "extend",
+            }
+            candidates.extend([c for c in call_names if c not in noise])
+
+            # 清洗 + 去重（保持顺序）
+            seen = set()
+            out: List[str] = []
+            for c in candidates:
+                c = str(c).strip()
+                if not c:
+                    continue
+                if len(c) > 80:
+                    continue
+                key = c.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(c)
+            return out
+
+        def extract_symbols_from_evidence(items: List[Dict[str, Any]]) -> List[str]:
+            symbols: List[str] = []
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                txt = str(it.get("content", ""))
+                scope = it.get("scope")
+                if isinstance(scope, dict) and scope.get("snippet"):
+                    txt = txt + "\n" + str(scope.get("snippet"))
+                symbols.extend(extract_symbols_from_text(txt))
+
+            # 只保留“像函数名”的末尾段（对 dotted 取最后一段）
+            normalized: List[str] = []
+            for s in symbols:
+                if "." in s:
+                    normalized.append(s.split(".")[-1])
+                else:
+                    normalized.append(s)
+
+            seen = set()
+            out: List[str] = []
+            for s in normalized:
+                s = str(s).strip()
+                if not s or len(s) < 3:
+                    continue
+                key = s.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(s)
+            return out
+
+        evaluation: Dict[str, Any] = {
+            "status": "inconclusive",
+            "confidence": 0.0,
+            "reason": "No evidence yet",
+            "next_keywords": [],
+        }
+
+        while tasks and tool_calls < max_tool_calls and len(evidence) < max_evidence_items:
+            task = tasks.popleft()
+            ttype = task.get("type")
+            value = task.get("value")
+            depth = int(task.get("depth") or 0)
+            max_depth_reached = max(max_depth_reached, depth)
+            if depth > max_depth:
+                continue
+
+            if ttype == "keyword":
+                print(f"     🔎 深挖搜索 '{value}' (d={depth})...", end=" ")
+                args = {"pattern": value}
+                run_trace.append({
+                    "type": "tool_request",
+                    "ts": datetime.now().isoformat(),
+                    "tool": "code_search",
+                    "arguments": args,
+                    "meta": {"stage": "VERIFY", "hypothesis": hypothesis, "depth": depth},
+                })
+                res = self.tool_agent.execute_tool("code_search", args)
+                tool_calls += 1
+                run_trace.append({
+                    "type": "tool_response",
+                    "ts": datetime.now().isoformat(),
+                    "tool": "code_search",
+                    "success": res.success,
+                    "error": res.error,
+                    "result": res.result,
+                    "meta": {"stage": "VERIFY", "hypothesis": hypothesis, "depth": depth},
+                })
+                if res.success and res.result:
+                    added = add_evidence_items(res.result, limit=10)
+                    print(f"✅ +{added}")
+                    self.trace.append(
+                        f"  深挖 search '{value}'(d={depth}): 命中 {len(res.result)}，采样 {added}"
+                    )
+                else:
+                    print("❌")
+
+            elif ttype == "symbol":
+                sym = str(value)
+
+                # 1) 跟定义
+                if tool_calls < max_tool_calls:
+                    args = {"function_name": sym}
+                    run_trace.append({
+                        "type": "tool_request",
+                        "ts": datetime.now().isoformat(),
+                        "tool": "find_function",
+                        "arguments": args,
+                        "meta": {"stage": "VERIFY", "hypothesis": hypothesis, "depth": depth},
+                    })
+                    fr = self.tool_agent.execute_tool("find_function", args)
+                    tool_calls += 1
+                    run_trace.append({
+                        "type": "tool_response",
+                        "ts": datetime.now().isoformat(),
+                        "tool": "find_function",
+                        "success": fr.success,
+                        "error": fr.error,
+                        "result": fr.result,
+                        "meta": {"stage": "VERIFY", "hypothesis": hypothesis, "depth": depth},
+                    })
+                    if fr.success and isinstance(fr.result, dict):
+                        add_evidence_items([fr.result], limit=1)
+
+                # 2) 跟引用
+                if tool_calls < max_tool_calls:
+                    args = {"symbol": sym}
+                    run_trace.append({
+                        "type": "tool_request",
+                        "ts": datetime.now().isoformat(),
+                        "tool": "find_references",
+                        "arguments": args,
+                        "meta": {"stage": "VERIFY", "hypothesis": hypothesis, "depth": depth},
+                    })
+                    rr = self.tool_agent.execute_tool("find_references", args)
+                    tool_calls += 1
+                    run_trace.append({
+                        "type": "tool_response",
+                        "ts": datetime.now().isoformat(),
+                        "tool": "find_references",
+                        "success": rr.success,
+                        "error": rr.error,
+                        "result": rr.result,
+                        "meta": {"stage": "VERIFY", "hypothesis": hypothesis, "depth": depth},
+                    })
+                    if rr.success and rr.result:
+                        add_evidence_items(rr.result, limit=10)
+
+            # 附加 scope（控制次数）
+            attached = 0
+            for item in evidence:
+                if attached >= max_scopes_to_attach:
+                    break
+                if attach_scope(item):
+                    attached += 1
+
+            # 有了证据就做一次评估，决定是否继续深挖
+            if evidence and (len(evidence) >= 3 or depth >= 1):
+                evaluation = self._evaluate_hypothesis_with_evidence(hypothesis, evidence, run_trace)
+                status = str(evaluation.get("status", "inconclusive"))
+                if status in ("confirmed", "rejected"):
+                    break
+
+                # inconclusive：追加 next_keywords 继续挖
+                nk = evaluation.get("next_keywords")
+                if isinstance(nk, list) and nk and depth < max_depth:
+                    for kw in nk[:5]:
+                        kw = self._clean_keyword(kw)
+                        if not kw:
+                            continue
+                        key = ("keyword", kw)
+                        if key in task_seen:
+                            continue
+                        task_seen.add(key)
+                        tasks.append({"type": "keyword", "value": kw, "depth": depth + 1})
+
+            # 从当前证据抽取符号并跟进（递归到调用/引用链）
+            if evidence and depth < max_depth:
+                symbols = extract_symbols_from_evidence(evidence)
+                followed = 0
+                for sym in symbols:
+                    if followed >= max_symbols_to_follow:
+                        break
+                    key = ("symbol", sym)
+                    if key in task_seen:
+                        continue
+                    task_seen.add(key)
+                    tasks.append({"type": "symbol", "value": sym, "depth": depth + 1})
+                    followed += 1
+
+        meta = {
+            "tool_calls": tool_calls,
+            "evidence_items": len(evidence),
+            "max_depth_reached": max_depth_reached,
+        }
+        return evidence, evaluation, meta
 
     def _conclude(self, pr: PR, verification_results: List[Dict[str, Any]], run_trace: List[Dict[str, Any]]) -> ReviewResult:
         """CONCLUDE 阶段：生成结论"""

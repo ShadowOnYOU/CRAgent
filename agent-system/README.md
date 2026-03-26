@@ -98,6 +98,40 @@ python main.py
 python main.py --diff changes.diff --title "Fix bug in user module"
 ```
 
+## 🆕 近期更新（更贴近“真实 code review”）
+
+以下能力已在主流程（LongCoT）中落地：
+
+- READ：输入包含真实 diff（按预算截断）+ 可选 Context
+- HYPOTHESIZE：强制 JSON 输出，并带解析 fallback
+- VERIFY：检索关键词由 LLM 主导生成（含缓存/清洗/正则回退）
+- VERIFY：从“命中即停”升级为“可控递归深挖”
+  - keyword → code_search
+  - 从证据片段抽取候选 symbol → find_function / find_references
+  - 证据不足时利用 next_keywords 继续挖掘
+  - 带上限控制（最大深度/最大工具调用/最大证据条数），避免 token 与耗时爆炸
+- 证据粒度：通过 get_function_context 将“单行命中”升级为“函数级片段”（Python 优先 AST；其他语言回退行窗口）
+- 证据驱动判定：对每个假设输出 confirmed/rejected/inconclusive，并把理由与证据传递到结论
+- run_trace：记录 llm_request/llm_response/tool_request/tool_response/run_start/run_end，便于复盘与 Debug
+
+运行流程的更详细说明见仓库根目录：[运行流程详解.md](../%E8%BF%90%E8%A1%8C%E6%B5%81%E7%A8%8B%E8%AF%A6%E8%A7%A3.md)
+
+## ▶️ 跑 sample-lib 示例（推荐）
+
+仓库自带了一个可复现实例（`sample-lib/`）以及对应 diff：
+
+```bash
+cd agent-system
+export DASHSCOPE_API_KEY=your_api_key_here
+
+# 评审 sample-lib 的示例 diff
+python main.py \
+  --diff ../sample-lib/pr_diffs/001-introduce-cache-bug.diff \
+  --root ../sample-lib \
+  --title "SampleLib: Introduce cache bug" \
+  --output ../sample-lib/review_output.json
+```
+
 ## 📖 使用示例
 
 ### 基本使用
