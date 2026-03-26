@@ -302,6 +302,16 @@ index 0000000..1111111 100644
                     evidence=["return x"],
                     confidence=0.9,
                 ),
+                # ✅ 合法（路径归一化）：diff 常见 b/ 前缀
+                ReviewIssue(
+                    issue_type="一致性",
+                    severity=RiskLevel.MEDIUM,
+                    message="路径前缀应被归一化",
+                    file_path="b/a.py",
+                    line_number=1,
+                    evidence=["def foo():"],
+                    confidence=0.9,
+                ),
                 # ❌ 非法：文件不存在
                 ReviewIssue(
                     issue_type="空指针",
@@ -356,9 +366,10 @@ index 0000000..1111111 100644
             strict_facts=True,
         )
 
-        assert len(filtered.issues) == 1, f"期望保留 1 条，实际 {len(filtered.issues)} 条"
-        assert filtered.issues[0].file_path == file_path
-        assert filtered.issues[0].line_number == 3
+        assert len(filtered.issues) == 2, f"期望保留 2 条，实际 {len(filtered.issues)} 条"
+        kept = {(i.file_path, i.line_number) for i in filtered.issues}
+        assert ("a.py", 3) in kept
+        assert ("a.py", 1) in kept
 
     print("  ✅ 事实校验过滤通过：仅保留可定位且证据可复现的问题")
     return True

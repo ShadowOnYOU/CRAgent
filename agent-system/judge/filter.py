@@ -208,6 +208,12 @@ class ReviewFilter:
         - line_number 非法/不可定位 -> 剔除
         - evidence 为空或无法在文件/PR diff 中复现 -> 降级到低置信度（通常会被后续 min_confidence 剔除）
         """
+        normalized_path = self._normalize_issue_file_path(issue.file_path, root_path)
+        if normalized_path is None:
+            return None
+
+        issue = replace(issue, file_path=normalized_path)
+
         if not self._is_safe_relpath(issue.file_path):
             return None
 
@@ -253,6 +259,54 @@ class ReviewFilter:
             return replace(issue, confidence=min(issue.confidence, 0.3))
 
         return issue
+
+    def _normalize_issue_file_path(self, path: str, root_path: Optional[str]) -> Optional[str]:
+        """把模型/工具产出的路径归一化为仓库内的相对路径。
+
+        允许：
+        - 去掉 diff 常见前缀：a/、b/
+        - 去掉 ./
+        - 若传入的是“root_path 内的绝对路径”，转换为相对路径
+
+        仍然拒绝：
+        - root_path 之外的绝对路径
+        - 非法/空路径
+        """
+        if not path or not isinstance(path, str):
+            return None
+
+        p = path.strip().replace("\\", "/")
+        if not p:
+            return None
+
+        while p.startswith("./"):
+            p = p[2:]
+
+        if p.startswith("a/") or p.startswith("b/"):
+            p = p[2:]
+
+        if p in ("", ".", "/"):
+            return None
+
+        # 如果是绝对路径，且落在 root_path 下，则转成相对路径
+        if os.path.isabs(p):
+            if not root_path:
+                return None
+            try:
+                abs_root = os.path.abspath(root_path)
+                abs_p = os.path.abspath(p)
+                if os.path.commonpath([abs_root, abs_p]) != abs_root:
+                    return None
+                p = os.path.relpath(abs_p, abs_root).replace("\\", "/")
+            except Exception:
+                return None
+
+        # 统一路径形式（不在此处做安全拒绝，留给 _is_safe_relpath 处理）
+        p = os.path.normpath(p).replace("\\", "/")
+        if p in ("", "."):
+            return None
+
+        return p
 
     def _is_safe_relpath(self, path: str) -> bool:
         if not path or not isinstance(path, str):
