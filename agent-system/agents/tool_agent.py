@@ -134,6 +134,35 @@ class ToolAgent:
             },
             handler=self._ast_analysis_handler
         )
+
+        # 函数上下文工具（用于把搜索命中升级为“函数级证据”）
+        self.tools["get_function_context"] = ToolDefinition(
+            name="get_function_context",
+            description="给定文件路径与行号，返回该行所在函数/方法的范围与代码片段（Python 优先用 AST；其他语言回退为行窗口）。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "文件路径（可为绝对路径或相对 root_path）",
+                    },
+                    "line_number": {
+                        "type": "integer",
+                        "description": "命中行号（1-based）",
+                    },
+                    "context_lines": {
+                        "type": "integer",
+                        "description": "围绕命中行的上下文行数（在函数范围内截取），默认 25",
+                    },
+                    "max_lines": {
+                        "type": "integer",
+                        "description": "最大返回行数（超过则截断），默认 80",
+                    },
+                },
+                "required": ["file_path", "line_number"],
+            },
+            handler=self._get_function_context_handler,
+        )
         
         # Grep 工具
         self.tools["grep"] = ToolDefinition(
@@ -289,6 +318,109 @@ class ToolAgent:
                 tool_name="grep",
                 success=False,
                 error=str(e)
+            )
+
+    def _get_function_context_handler(self, args: Dict[str, Any]) -> ToolResult:
+        """返回命中行所在函数/方法的范围与代码片段。"""
+        import os
+
+        try:
+            file_path = str(args.get("file_path", ""))
+            line_number = int(args.get("line_number", 0))
+            context_lines = int(args.get("context_lines", 25))
+            max_lines = int(args.get("max_lines", 80))
+
+            if not file_path or line_number <= 0:
+                return ToolResult(
+                    tool_name="get_function_context",
+                    success=False,
+                    error="file_path and positive line_number are required",
+                )
+
+            full_path = file_path
+            if not os.path.isabs(full_path):
+                full_path = os.path.join(self.root_path, file_path)
+            if not os.path.exists(full_path):
+                return ToolResult(
+                    tool_name="get_function_context",
+                    success=False,
+                    error=f"File not found: {full_path}",
+                )
+
+            with open(full_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+            total_lines = len(lines)
+            line_number = max(1, min(line_number, total_lines))
+
+            def clip_window(start: int, end: int) -> Dict[str, Any]:
+                start = max(1, start)
+                end = min(total_lines, end)
+                window = lines[start - 1 : end]
+                truncated = len(window) > max_lines
+                if truncated:
+                    window = window[:max_lines]
+                return {
+                    "scope_type": "window",
+                    "name": "<window>",
+                    "line_start": start,
+                    "line_end": end,
+                    "match_line": line_number,
+                    "truncated": truncated,
+                    "snippet": "".join(window),
+                }
+
+            # Python：用 AST 找到最小覆盖范围的 FunctionDef
+            if full_path.endswith(".py"):
+                # ASTParser 内部会 join(root_path, file_path)，这里直接传绝对路径更稳
+                funcs = self.ast_parser.get_functions(full_path)
+                candidates = [
+                    fn for fn in funcs
+                    if fn.line_start <= line_number <= fn.line_end
+                ]
+                if candidates:
+                    fn = min(candidates, key=lambda x: (x.line_end - x.line_start, x.line_start))
+                    start = fn.line_start
+                    end = fn.line_end
+                    # 截取：优先给出命中行附近上下文，同时保留函数签名行
+                    win_start = max(start, line_number - context_lines)
+                    win_end = min(end, line_number + context_lines)
+
+                    snippet_lines = lines[win_start - 1 : win_end]
+                    truncated = len(snippet_lines) > max_lines or (win_start != start or win_end != end)
+                    if len(snippet_lines) > max_lines:
+                        snippet_lines = snippet_lines[:max_lines]
+
+                    # 确保包含函数定义行
+                    if start < win_start:
+                        snippet_lines = [lines[start - 1]] + ["...<omitted>...\n"] + snippet_lines
+
+                    return ToolResult(
+                        tool_name="get_function_context",
+                        success=True,
+                        result={
+                            "scope_type": "function",
+                            "name": fn.name,
+                            "line_start": start,
+                            "line_end": end,
+                            "match_line": line_number,
+                            "truncated": truncated,
+                            "snippet": "".join(snippet_lines),
+                        },
+                    )
+
+            # 非 Python 或 AST 找不到：回退为行窗口
+            return ToolResult(
+                tool_name="get_function_context",
+                success=True,
+                result=clip_window(line_number - context_lines, line_number + context_lines),
+            )
+
+        except Exception as e:
+            return ToolResult(
+                tool_name="get_function_context",
+                success=False,
+                error=str(e),
             )
     
     def get_tools_schema(self) -> List[Dict[str, Any]]:

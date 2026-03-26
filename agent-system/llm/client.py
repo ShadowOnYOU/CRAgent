@@ -193,7 +193,7 @@ class LLMClient:
             if chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content
     
-    def extract_json(self, text: str) -> Optional[Dict[str, Any]]:
+    def extract_json(self, text: str) -> Optional[Any]:
         """
         从文本中提取 JSON
         
@@ -201,7 +201,7 @@ class LLMClient:
             text: 包含 JSON 的文本
             
         Returns:
-            解析后的 JSON 对象
+            解析后的 JSON 对象（可能为 dict / list / 其他 JSON 基础类型）
         """
         # 尝试查找 ```json 代码块
         import re
