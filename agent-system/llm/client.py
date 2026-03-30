@@ -133,7 +133,11 @@ class LLMClient:
     
     def chat_with_tools(self, messages: List[Dict[str, str]],
                         tools: List[Dict[str, Any]],
-                        temperature: Optional[float] = None) -> Dict[str, Any]:
+                        temperature: Optional[float] = None,
+                        max_tokens: Optional[int] = None,
+                        show_progress: bool = True,
+                        trace: Optional[List[Dict[str, Any]]] = None,
+                        trace_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         发送带工具调用的聊天请求
         
@@ -145,11 +149,31 @@ class LLMClient:
         Returns:
             包含回复内容或工具调用信息的字典
         """
+        if show_progress:
+            print(f"  [LLM] 正在调用 {self.model} 模型，请稍候...")
+
+        if trace is not None:
+            tool_names = []
+            try:
+                tool_names = [t.get("function", {}).get("name") for t in (tools or []) if isinstance(t, dict)]
+            except Exception:
+                tool_names = []
+            trace.append({
+                "type": "llm_request",
+                "ts": datetime.now().isoformat(),
+                "model": self.model,
+                "temperature": temperature or config.llm.temperature,
+                "max_tokens": max_tokens or config.llm.max_tokens,
+                "messages": self._truncate_messages(messages),
+                "meta": {**(trace_meta or {}), "tools": tool_names[:50]},
+            })
+
         response = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
             tools=tools,
-            temperature=temperature or config.llm.temperature
+            temperature=temperature or config.llm.temperature,
+            max_tokens=max_tokens or config.llm.max_tokens,
         )
         
         choice = response.choices[0]
@@ -162,11 +186,37 @@ class LLMClient:
         
         if message.tool_calls:
             for tc in message.tool_calls:
+                args_obj: Any
+                raw_args = getattr(tc.function, "arguments", None)
+                try:
+                    args_obj = json.loads(raw_args) if raw_args else {}
+                except Exception:
+                    # 某些模型会返回非严格 JSON，这里保留原始字符串，避免直接崩溃
+                    args_obj = {"_raw": raw_args}
                 result["tool_calls"].append({
                     "id": tc.id,
                     "name": tc.function.name,
-                    "arguments": json.loads(tc.function.arguments)
+                    "arguments": args_obj
                 })
+
+        if show_progress:
+            print(f"  [LLM] 响应完成")
+
+        if trace is not None:
+            trace.append({
+                "type": "llm_response",
+                "ts": datetime.now().isoformat(),
+                "model": self.model,
+                "content": self._truncate_text(message.content),
+                "meta": {
+                    **(trace_meta or {}),
+                    "tool_calls": [
+                        {"id": tc.get("id"), "name": tc.get("name")}
+                        for tc in (result.get("tool_calls") or [])
+                        if isinstance(tc, dict)
+                    ][:50],
+                },
+            })
         
         return result
     

@@ -114,6 +114,8 @@ python main.py --diff changes.diff --title "Fix bug in user module"
 python test_framework.py
 ```
 
+其中包含一个离线回归用例，验证 LongCoT 的 `chat_with_tools` 工具回路可执行（fake LLM + fake tools），用于确保“模型发起 tool_calls → 本地执行 → 回填 → 最终 JSON”这条链路不依赖真实 API。
+
 2) **真实 LLM 的集成测试脚本**（会产生真实 API 调用；未设置 key 时默认跳过）
 
 ```bash
@@ -140,6 +142,10 @@ python test_llm_filter_integration.py --require-key
 - READ：输入包含真实 diff（按预算截断）+ 可选 Context
 - HYPOTHESIZE：强制 JSON 输出，并带解析 fallback
 - VERIFY：检索关键词由 LLM 主导生成（含缓存/清洗/正则回退）
+- VERIFY：支持“函数调用式工具回路”（`chat_with_tools`）
+  - LLM 发起 `tool_calls`（如 `read_file/code_search/find_references/get_function_context`）
+  - 本地工具执行并回填结果，直到 LLM 输出最终 JSON 结论
+  - 若模型不走 tool_calls 或回路无有效证据，会自动回退到原有“可控递归深挖”逻辑
 - VERIFY：从“命中即停”升级为“可控递归深挖”
   - keyword → code_search
   - 从证据片段抽取候选 symbol → find_function / find_references
@@ -148,6 +154,7 @@ python test_llm_filter_integration.py --require-key
 - 证据粒度：通过 get_function_context 将“单行命中”升级为“函数级片段”（Python 优先 AST；其他语言回退行窗口）
 - 证据驱动判定：对每个假设输出 confirmed/rejected/inconclusive，并把理由与证据传递到结论
 - run_trace：记录 llm_request/llm_response/tool_request/tool_response/run_start/run_end，便于复盘与 Debug
+  - 工具回路相关事件会标记在 `meta.stage=VERIFY_TOOL_LOOP` 下，并附带 tool_calls 摘要
 
 运行流程的更详细说明见仓库根目录：[运行流程详解.md](../%E8%BF%90%E8%A1%8C%E6%B5%81%E7%A8%8B%E8%AF%A6%E8%A7%A3.md)
 

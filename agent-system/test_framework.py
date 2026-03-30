@@ -424,6 +424,107 @@ def test_l1_checklist_injection():
     print(f"  ✅ Checklist 注入成功：{len(ctx.checklist)} 条规则")
     return True
 
+
+def test_longcot_chat_with_tools_loop():
+    """测试 LongCoT 接入 chat_with_tools 的工具调用回路（不依赖真实 API）。"""
+    print("=" * 50)
+    print("测试 LongCoT chat_with_tools 工具回路...")
+
+    import json
+
+    from models import ToolResult
+    from reasoning.long_cot import LongCoTEngine
+
+    class FakeLLMClient:
+        def __init__(self):
+            self.model = "fake-model"
+            self.calls = 0
+
+        def chat_with_tools(self, messages, tools, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "name": "code_search",
+                            "arguments": {"pattern": "load_json_config"},
+                        }
+                    ],
+                }
+            return {
+                "content": json.dumps(
+                    {
+                        "status": "confirmed",
+                        "confidence": 0.8,
+                        "reason": "Evidence supports hypothesis",
+                        "next_keywords": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                "tool_calls": [],
+            }
+
+        def extract_json(self, text):
+            try:
+                return json.loads(text)
+            except Exception:
+                return None
+
+    class FakeToolAgent:
+        def get_tools_schema(self):
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "code_search",
+                        "description": "fake code search",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"pattern": {"type": "string"}},
+                            "required": ["pattern"],
+                        },
+                    },
+                }
+            ]
+
+        def execute_tool(self, tool_name, arguments):
+            if tool_name != "code_search":
+                return ToolResult(tool_name=str(tool_name), success=False, error="unknown tool")
+            return ToolResult(
+                tool_name="code_search",
+                success=True,
+                result=[
+                    {
+                        "file": "src/samplelib2/config_loader.py",
+                        "line": 14,
+                        "content": "def load_json_config(path: str) -> dict:",
+                    }
+                ],
+            )
+
+    class FakePR:
+        pr_id = "fake"
+        title = "fake"
+        changes = []
+
+    engine = LongCoTEngine(FakeLLMClient(), FakeToolAgent())
+    run_trace = []
+    evidence, evaluation, meta = engine._mine_evidence_with_chat_tools(
+        pr=FakePR(),
+        hypothesis="load_json_config 存在资源泄漏",
+        seed_keywords=["load_json_config"],
+        run_trace=run_trace,
+    )
+
+    assert isinstance(evidence, list) and len(evidence) >= 1
+    assert isinstance(evaluation, dict) and evaluation.get("status") == "confirmed"
+    assert isinstance(meta, dict) and meta.get("mode") == "chat_with_tools"
+
+    print("  ✅ 工具回路可用：能执行 tool_calls 并返回最终 JSON")
+    return True
+
 def main():
     """主函数"""
     print("\n" + "=" * 60)
@@ -437,6 +538,7 @@ def main():
         ("过滤器", test_filter),
         ("过滤器事实校验", test_filter_fact_checks),
         ("L1 Checklist 注入", test_l1_checklist_injection),
+        ("LongCoT 工具回路", test_longcot_chat_with_tools_loop),
         ("反馈模块", test_feedback),
         ("简单评审", test_simple_review),
     ]

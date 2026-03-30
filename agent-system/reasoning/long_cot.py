@@ -79,6 +79,22 @@ class LongCoTEngine:
 }
 """
 
+    VERIFY_TOOL_LOOP_SYSTEM = """你是代码缺陷验证专家，并且你可以调用工具来检索代码证据。
+
+目标：针对给定“缺陷假设”，通过工具收集可复现证据，然后输出严格 JSON 结论：
+{
+    "status": "confirmed|rejected|inconclusive",
+    "confidence": 0.0,
+    "reason": "...",
+    "next_keywords": ["...", "..."]
+}
+
+规则：
+1) 在你给出最终 JSON 之前，应优先通过工具获取证据（例如 code_search / get_function_context / find_references / read_file 等）。
+2) 最终只输出 JSON（不允许 Markdown 代码块）。
+3) 如果证据不足，请输出 inconclusive，并给出 next_keywords（最多 5 个）。
+"""
+
     def __init__(self, llm_client: LLMClient, tool_agent: ToolAgent, max_iterations: int = 3):
         """
         初始化推理引擎
@@ -355,12 +371,20 @@ class LongCoTEngine:
             keywords = self._extract_search_keywords(hypothesis, run_trace)
             print(f"   关键词：{', '.join(keywords[:3])}")
 
-            evidence, evaluation, mining_meta = self._mine_evidence_until_conclusion(
+            # 优先走 chat_with_tools 的工具调用回路；必要时回退到旧的手工挖掘逻辑
+            evidence, evaluation, mining_meta = self._mine_evidence_with_chat_tools(
                 pr=pr,
                 hypothesis=hypothesis,
                 seed_keywords=keywords,
                 run_trace=run_trace,
             )
+            if not evidence:
+                evidence, evaluation, mining_meta = self._mine_evidence_until_conclusion(
+                    pr=pr,
+                    hypothesis=hypothesis,
+                    seed_keywords=keywords,
+                    run_trace=run_trace,
+                )
 
             if not evidence:
                 remaining.append(hypothesis)
@@ -408,6 +432,217 @@ class LongCoTEngine:
         
         print(f"\n   📊 验证完成：{len(results)} 个已验证，{len(remaining)} 个待验证")
         return results, remaining
+
+    def _mine_evidence_with_chat_tools(
+        self,
+        pr: PR,
+        hypothesis: str,
+        seed_keywords: List[str],
+        run_trace: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+        """使用 LLM 的 chat_with_tools 走工具调用回路来挖掘证据。
+
+        这是对 VERIFY 的“接入工具调用回路”的实现：
+        - LLM 负责决定调用哪些工具以及参数
+        - 本地执行工具并把结果回灌给 LLM
+        - 当 LLM 不再请求工具时，期望输出严格 JSON 结论
+
+        返回：evidence（结构与旧逻辑兼容）、evaluation JSON、meta。
+        """
+        tools = []
+        try:
+            tools = self.tool_agent.get_tools_schema()
+        except Exception:
+            tools = []
+
+        max_steps = 10
+        max_evidence_items = 20
+        evidence: List[Dict[str, Any]] = []
+        evidence_seen = set()
+        tool_calls = 0
+
+        changed_files = [c.file_path for c in getattr(pr, "changes", []) or []]
+        seed = ", ".join([k for k in (seed_keywords or [])[:8] if isinstance(k, str)])
+
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": self.VERIFY_TOOL_LOOP_SYSTEM},
+            {
+                "role": "user",
+                "content": (
+                    "请验证以下缺陷假设，并通过工具收集证据。\n\n"
+                    f"假设：{hypothesis}\n\n"
+                    f"变更文件：{changed_files}\n"
+                    f"建议起始关键词：{seed}\n\n"
+                    "注意：最终只输出严格 JSON。"
+                ),
+            },
+        ]
+
+        def _add_evidence_item(item: Dict[str, Any]) -> None:
+            if not isinstance(item, dict):
+                return
+            key = (item.get("file"), item.get("line"), item.get("content"))
+            if key in evidence_seen:
+                return
+            evidence_seen.add(key)
+            evidence.append(item)
+
+        def _add_from_tool_result(tool_name: str, args: Dict[str, Any], tool_result: Any) -> None:
+            if len(evidence) >= max_evidence_items:
+                return
+
+            if not getattr(tool_result, "success", False):
+                return
+
+            result_obj = getattr(tool_result, "result", None)
+
+            # 常见检索类工具：返回 list[dict(file,line,content)]
+            if tool_name in {"code_search", "find_references", "grep"}:
+                if isinstance(result_obj, list):
+                    for it in result_obj[: max(0, max_evidence_items - len(evidence))]:
+                        if isinstance(it, dict) and it.get("file") and it.get("line"):
+                            _add_evidence_item({
+                                "file": it.get("file"),
+                                "line": it.get("line"),
+                                "content": it.get("content", ""),
+                            })
+                return
+
+            # find_function：返回 dict(file,line,content)
+            if tool_name == "find_function" and isinstance(result_obj, dict):
+                _add_evidence_item({
+                    "file": result_obj.get("file"),
+                    "line": result_obj.get("line"),
+                    "content": result_obj.get("content", ""),
+                })
+                return
+
+            # get_function_context：返回 scope/snippet
+            if tool_name == "get_function_context" and isinstance(result_obj, dict):
+                file_path = args.get("file_path")
+                line_no = args.get("line_number")
+                _add_evidence_item({
+                    "file": file_path,
+                    "line": line_no,
+                    "content": f"in {result_obj.get('scope_type')} {result_obj.get('name')} [{result_obj.get('line_start')}-{result_obj.get('line_end')}]",
+                    "scope": result_obj,
+                })
+                return
+
+            # read_file：太长就不直接塞 evidence（避免膨胀），但仍可被 LLM 在对话里引用
+            return
+
+        evaluation: Dict[str, Any] = {
+            "status": "inconclusive",
+            "confidence": 0.0,
+            "reason": "No conclusion yet",
+            "next_keywords": [],
+        }
+
+        for step in range(max_steps):
+            resp = self.llm_client.chat_with_tools(
+                messages,
+                tools=tools,
+                show_progress=False,
+                trace=run_trace,
+                trace_meta={"stage": "VERIFY_TOOL_LOOP", "hypothesis": hypothesis[:200], "step": step},
+            )
+
+            tool_calls_list = resp.get("tool_calls") or []
+            content = resp.get("content")
+
+            if tool_calls_list:
+                # 需要把 assistant 的 tool_calls 原样写回 messages，OpenAI 才能正确关联 tool_call_id
+                assistant_msg: Dict[str, Any] = {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": [],
+                }
+                for tc in tool_calls_list:
+                    if not isinstance(tc, dict):
+                        continue
+                    tc_id = tc.get("id")
+                    name = tc.get("name")
+                    arguments = tc.get("arguments") or {}
+                    try:
+                        arguments_json = json.dumps(arguments, ensure_ascii=False)
+                    except Exception:
+                        arguments_json = json.dumps({"_raw": str(arguments)}, ensure_ascii=False)
+                    assistant_msg["tool_calls"].append({
+                        "id": tc_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments_json},
+                    })
+                messages.append(assistant_msg)
+
+                for tc in tool_calls_list:
+                    if len(evidence) >= max_evidence_items:
+                        break
+                    if not isinstance(tc, dict):
+                        continue
+                    tc_id = tc.get("id")
+                    name = tc.get("name")
+                    arguments = tc.get("arguments") or {}
+
+                    # trace tool call
+                    run_trace.append({
+                        "type": "tool_request",
+                        "ts": datetime.now().isoformat(),
+                        "tool": name,
+                        "arguments": arguments,
+                        "meta": {"stage": "VERIFY_TOOL_LOOP", "hypothesis": hypothesis, "step": step},
+                    })
+                    tool_result = self.tool_agent.execute_tool(str(name), arguments if isinstance(arguments, dict) else {})
+                    tool_calls += 1
+                    run_trace.append({
+                        "type": "tool_response",
+                        "ts": datetime.now().isoformat(),
+                        "tool": name,
+                        "success": getattr(tool_result, "success", False),
+                        "error": getattr(tool_result, "error", None),
+                        "result": getattr(tool_result, "result", None),
+                        "meta": {"stage": "VERIFY_TOOL_LOOP", "hypothesis": hypothesis, "step": step},
+                    })
+
+                    _add_from_tool_result(str(name), arguments if isinstance(arguments, dict) else {}, tool_result)
+
+                    # 把工具结果回灌给 LLM
+                    try:
+                        tool_payload = {
+                            "tool": str(name),
+                            "success": getattr(tool_result, "success", False),
+                            "error": getattr(tool_result, "error", None),
+                            "result": getattr(tool_result, "result", None),
+                        }
+                        tool_content = json.dumps(tool_payload, ensure_ascii=False)
+                    except Exception:
+                        tool_content = json.dumps({"tool": str(name), "success": False, "error": "tool_result_not_serializable"}, ensure_ascii=False)
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": tool_content,
+                    })
+
+                continue
+
+            # 无工具调用：期望是最终 JSON
+            if isinstance(content, str) and content.strip():
+                parsed = self.llm_client.extract_json(content)
+                if isinstance(parsed, dict) and parsed.get("status") in ("confirmed", "rejected", "inconclusive"):
+                    evaluation = parsed
+                    break
+                # 否则：用已收集证据做一次二次评估
+                if evidence:
+                    evaluation = self._evaluate_hypothesis_with_evidence(hypothesis, evidence, run_trace)
+                break
+
+        meta = {
+            "tool_calls": tool_calls,
+            "evidence_items": len(evidence),
+            "mode": "chat_with_tools",
+        }
+        return evidence, evaluation, meta
 
     def _mine_evidence_until_conclusion(
         self,
