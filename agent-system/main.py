@@ -337,6 +337,7 @@ def main():
                         "message": i.message,
                         "file": i.file_path,
                         "line": i.line_number,
+                        "evidence": i.evidence,
                         "suggestion": i.suggestion
                     }
                     for i in result.issues

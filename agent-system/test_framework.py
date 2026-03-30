@@ -81,6 +81,29 @@ def test_pr_parser():
     print(f"  ✅ 解析成功，发现 {len(changes)} 个文件变更")
     for change in changes:
         print(f"     - {change.file_path} (行 {change.line_start}-{change.line_end})")
+
+    # 额外回归：multi-hunk 映射与 hunk 元信息
+    diff2 = """diff --git a/x.py b/x.py
+index 0000000..1111111 100644
+--- a/x.py
++++ b/x.py
+@@ -1,3 +1,3 @@
+ a = 1
+-b = 2
++b = 3
+ c = 4
+@@ -10,2 +10,3 @@
+ x = 10
+ y = 11
++z = 12
+"""
+    changes2 = parser.parse_diff(diff2)
+    assert len(changes2) == 1
+    c2 = changes2[0]
+    assert c2.diff_hunks, "期望解析到 diff_hunks"
+    assert c2.new_line_to_diff_line, "期望构建 new_line_to_diff_line 映射"
+    assert 1 in c2.new_line_to_diff_line
+    assert 10 in c2.new_line_to_diff_line
     
     return True
 

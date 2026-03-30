@@ -10,7 +10,7 @@ from collections import deque
 import sys
 sys.path.insert(0, '.')
 
-from models import PR, Context, ReviewResult, ReviewIssue, RiskLevel
+from models import PR, Context, ReviewResult, ReviewIssue, RiskLevel, normalize_evidence
 from llm.client import LLMClient
 from agents.tool_agent import ToolAgent
 from config.settings import config
@@ -1123,7 +1123,11 @@ class LongCoTEngine:
                 message=issue_data.get("message", ""),
                 file_path=issue_data.get("file_path", ""),
                 line_number=issue_data.get("line_number", 0),
-                evidence=issue_data.get("evidence", []),
+                evidence=normalize_evidence(
+                    issue_data.get("evidence", []),
+                    default_file_path=str(issue_data.get("file_path", "")),
+                    default_line_number=int(issue_data.get("line_number", 0) or 0),
+                ),
                 suggestion=issue_data.get("suggestion", "")
             )
             result.issues.append(issue)

@@ -196,9 +196,11 @@ python main.py --root sample-lib-2 --diff 002-silent-failure-and-leak.diff --no-
 
 - `file_path` 必须能归一化到 root 内的相对路径
 - `line_number` 必须能在文件或 diff hunk 中定位
-- `evidence` 必须能在“文件内容 / PR diff / new_content”里复现匹配（匹配不到会降级置信度并通常被阈值剔除）
+- `evidence` 统一为结构化列表（`file_path/line_start/line_end/snippet/hash`，可选 `diff_line`），并要求 snippet 能在“文件内容 / PR diff / new_content”里复现匹配（匹配不到会降级置信度并通常被阈值剔除）
 
 因此更推荐让 CONCLUDE 输出的 evidence 尽量贴近真实代码行（例如 `path:line | code` 这种形式），以减少误杀。
+
+提示：当你使用 `--output` 落盘结果时，输出 JSON 的 `issues[]` 会包含 `evidence` 字段（含可选 `diff_line`），便于复盘与强校验。
 
 ## 📖 使用示例
 

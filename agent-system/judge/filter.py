@@ -7,12 +7,12 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import replace
-from typing import List, Optional, Set, Tuple
+from typing import Any, List, Optional, Set, Tuple
 
 import sys
 sys.path.insert(0, '.')
 
-from models import ReviewResult, ReviewIssue, RiskLevel
+from models import ReviewResult, ReviewIssue, RiskLevel, normalize_evidence
 from llm.client import LLMClient
 from models import PR
 
@@ -155,9 +155,10 @@ class ReviewFilter:
         # 构建评审意见列表
         issues_text = ""
         for i, issue in enumerate(result.issues, 1):
+            evidence_snippets = self._evidence_to_snippets(issue.evidence)
             issues_text += f"{i}. [{issue.severity.value}] {issue.issue_type}: {issue.message}\n"
             issues_text += f"   文件：{issue.file_path}:{issue.line_number}\n"
-            issues_text += f"   证据：{issue.evidence}\n"
+            issues_text += f"   证据：{evidence_snippets}\n"
             issues_text += f"   建议：{issue.suggestion}\n\n"
         
         messages = [
@@ -181,7 +182,10 @@ class ReviewFilter:
             # 解析失败，返回原始结果
             return result
         
-        keep_indices = json_data.get("keep", [])
+        keep_indices = self._validate_llm_judge_keep_indices(json_data, total=len(result.issues))
+        if keep_indices is None:
+            # judge 输出非法/不可用，返回原始结果
+            return result
         
         filtered = ReviewResult(
             pr_id=result.pr_id,
@@ -189,9 +193,21 @@ class ReviewFilter:
             run_trace=result.run_trace
         )
         
+        keep_set = set(keep_indices)
         for i, issue in enumerate(result.issues, 1):
-            if i in keep_indices:
+            if i in keep_set:
                 filtered.issues.append(issue)
+
+        # 若开启 strict_facts：对 judge 最终保留的问题再做一次强校验
+        if strict_facts:
+            filtered = self.filter(
+                filtered,
+                min_severity=RiskLevel.LOW,
+                min_confidence=0.3,
+                pr=pr,
+                root_path=root_path,
+                strict_facts=True,
+            )
         
         filtered.summary = f"经过 LLM 评估，保留 {len(filtered.issues)} 个高价值问题"
         return filtered
@@ -215,6 +231,16 @@ class ReviewFilter:
 
         issue = replace(issue, file_path=normalized_path)
 
+        # 统一 evidence 为结构化列表（兼容历史 List[str]）
+        issue = replace(
+            issue,
+            evidence=normalize_evidence(
+                issue.evidence,
+                default_file_path=issue.file_path,
+                default_line_number=issue.line_number,
+            ),
+        )
+
         if not self._is_safe_relpath(issue.file_path):
             return None
 
@@ -223,6 +249,23 @@ class ReviewFilter:
 
         file_text = self._try_read_file(root_path, issue.file_path)
 
+        # 若能从 PR diff 构建映射，则优先把 diff_line 写回 evidence（便于定位具体 hunk/行）
+        change = None
+        if pr is not None:
+            change = self._find_change_for_file(pr, issue.file_path)
+            if change is None:
+                # PR 中没有该文件的变更：在 strict_facts 下属于不可定位
+                # 但考虑到某些场景 issue.file_path 可能是旧路径/rename，这里先按原逻辑继续
+                pass
+            else:
+                if self._is_line_locatable_in_change(change, issue.line_number):
+                    issue = self._attach_diff_line_to_evidence(issue, change)
+                else:
+                    issue = replace(issue, confidence=min(issue.confidence, 0.4))
+
+        # 归一化 evidence item 的 file_path：统一成仓库内相对路径（避免绝对路径污染复盘/校验）
+        issue = replace(issue, evidence=self._normalize_evidence_items(issue.evidence, root_path, issue.file_path))
+
         # 1) file/line 的“存在性与范围”校验
         if file_text is not None:
             if not self._is_line_in_file(file_text, issue.line_number):
@@ -230,11 +273,12 @@ class ReviewFilter:
         else:
             # 文件不在磁盘上：允许退化到 PR diff 的 hunk 新文件行范围校验
             if pr is not None:
-                change = self._find_change_for_file(pr, issue.file_path)
+                if change is None:
+                    change = self._find_change_for_file(pr, issue.file_path)
                 if change is None:
                     return None
 
-                if not self._is_line_in_diff_hunks(change.diff, issue.line_number):
+                if not self._is_line_locatable_in_change(change, issue.line_number):
                     # 能找到文件但无法定位到任何 hunk：降级而非立刻剔除
                     issue = replace(issue, confidence=min(issue.confidence, 0.4))
             else:
@@ -376,6 +420,83 @@ class ReviewFilter:
                 return True
         return False
 
+    def _is_line_locatable_in_change(self, change, line_number: int) -> bool:
+        """优先用 new_line_to_diff_line 映射定位；退化到 hunk range 检查。"""
+        try:
+            mapping = getattr(change, "new_line_to_diff_line", None)
+            if isinstance(mapping, dict) and mapping:
+                return int(line_number) in mapping
+        except Exception:
+            pass
+        return self._is_line_in_diff_hunks(getattr(change, "diff", "") or "", line_number)
+
+    def _attach_diff_line_to_evidence(self, issue: ReviewIssue, change) -> ReviewIssue:
+        """将 diff_line 填充到 evidence item，便于定位具体 hunk/行。"""
+        try:
+            mapping = getattr(change, "new_line_to_diff_line", None)
+            if not isinstance(mapping, dict) or not mapping:
+                return issue
+        except Exception:
+            return issue
+
+        new_evidence: List[dict] = []
+        for ev in issue.evidence or []:
+            if not isinstance(ev, dict):
+                continue
+            ls = ev.get("line_start") or ev.get("line_number") or issue.line_number
+            try:
+                ls_i = int(ls or 0)
+            except Exception:
+                ls_i = 0
+            diff_line = 0
+            if ls_i > 0 and ls_i in mapping:
+                try:
+                    diff_line = int(mapping[ls_i])
+                except Exception:
+                    diff_line = 0
+            ev2 = dict(ev)
+            if diff_line and not ev2.get("diff_line"):
+                ev2["diff_line"] = diff_line
+            new_evidence.append(ev2)
+        if not new_evidence:
+            return issue
+        return replace(issue, evidence=new_evidence)
+
+    def _normalize_evidence_items(self, evidence_list: List[Any], root_path: Optional[str], issue_file_path: str) -> List[Any]:
+        out: List[Any] = []
+        for ev in evidence_list or []:
+            if not isinstance(ev, dict):
+                out.append(ev)
+                continue
+
+            fp = str(ev.get("file_path") or ev.get("file") or "").strip()
+            normalized_fp = None
+            if fp:
+                normalized_fp = self._normalize_issue_file_path(fp, root_path)
+
+            # 如果 evidence 自己的 file_path 归一化失败，则回退到 issue.file_path
+            if not normalized_fp:
+                normalized_fp = issue_file_path
+
+            ev2 = dict(ev)
+            ev2["file_path"] = normalized_fp
+            out.append(ev2)
+
+        return out
+
+    def _evidence_to_snippets(self, evidence_list: List[Any]) -> List[str]:
+        snippets: List[str] = []
+        for ev in (evidence_list or [])[:3]:
+            if isinstance(ev, dict):
+                s = str(ev.get("snippet") or ev.get("content") or "").strip()
+                if s:
+                    snippets.append(s)
+                continue
+            s = str(ev).strip()
+            if s:
+                snippets.append(s)
+        return snippets
+
     def _normalize_for_search(self, text: str) -> str:
         # 去掉常见包装，压缩空白
         text = text.strip()
@@ -384,10 +505,13 @@ class ReviewFilter:
         text = re.sub(r"\s+", " ", text)
         return text
 
-    def _extract_evidence_fragments(self, evidence: str) -> List[str]:
-        if not evidence:
+    def _extract_evidence_fragments(self, evidence: Any) -> List[str]:
+        if evidence is None:
             return []
-        raw = evidence.strip()
+        if isinstance(evidence, dict):
+            raw = str(evidence.get("snippet") or evidence.get("content") or "").strip()
+        else:
+            raw = str(evidence).strip()
         if not raw:
             return []
 
@@ -417,7 +541,7 @@ class ReviewFilter:
             fragments = [raw]
         return fragments
 
-    def _evidence_is_reproducible(self, evidence_list: List[str], searchable_texts: List[str]) -> bool:
+    def _evidence_is_reproducible(self, evidence_list: List[Any], searchable_texts: List[str]) -> bool:
         if not searchable_texts:
             return False
 
@@ -433,6 +557,52 @@ class ReviewFilter:
                 if any(frag_n in target for target in normalized_targets):
                     return True
         return False
+
+    def _validate_llm_judge_keep_indices(self, json_data: dict, total: int) -> Optional[List[int]]:
+        """严格校验 LLM Judge 输出，防止 keep/remove 越界或类型错误。
+
+        规则：
+        - keep/remove 需为列表（元素可转 int）
+        - 超出 [1,total] 的索引会被忽略
+        - 若 keep 为空但 remove 非空：keep = all - remove
+        - 若 keep/remove 都为空：返回 None（表示不可用，回退到原结果）
+        """
+        if not isinstance(json_data, dict):
+            return None
+        if total <= 0:
+            return []
+
+        keep_raw = json_data.get("keep", [])
+        remove_raw = json_data.get("remove", [])
+        if keep_raw is None:
+            keep_raw = []
+        if remove_raw is None:
+            remove_raw = []
+        if not isinstance(keep_raw, list) or not isinstance(remove_raw, list):
+            return None
+
+        def to_idx_set(xs: List[Any]) -> Set[int]:
+            out: Set[int] = set()
+            for x in xs:
+                try:
+                    i = int(x)
+                except Exception:
+                    continue
+                if 1 <= i <= total:
+                    out.add(i)
+            return out
+
+        keep_set = to_idx_set(keep_raw)
+        remove_set = to_idx_set(remove_raw)
+
+        if not keep_set and not remove_set:
+            return None
+        if not keep_set and remove_set:
+            keep_set = set(range(1, total + 1)) - remove_set
+        # 若 keep/remove 都给了：以 keep 为主，移除冲突项
+        keep_set = keep_set - remove_set
+
+        return sorted(keep_set)
     
     def _is_low_value(self, issue: ReviewIssue) -> bool:
         """检查是否为低价值问题"""

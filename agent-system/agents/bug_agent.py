@@ -8,7 +8,7 @@ from typing import List, Dict, Any, Optional
 import sys
 sys.path.insert(0, '.')
 
-from models import ReviewIssue, RiskLevel, PR, CodeChange, Context, ReviewResult
+from models import ReviewIssue, RiskLevel, PR, CodeChange, Context, ReviewResult, normalize_evidence
 from llm.client import LLMClient
 from agents.tool_agent import ToolAgent
 
@@ -40,7 +40,6 @@ class BugAgent:
             "issue_type": "问题类型",
             "severity": "critical|high|medium|low",
             "message": "问题描述",
-            "file_path": "文件路径",
             "line_number": 行号，
             "evidence": ["证据 1", "证据 2"],
             "suggestion": "修复建议"
