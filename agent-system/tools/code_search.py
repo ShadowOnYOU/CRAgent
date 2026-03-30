@@ -148,7 +148,7 @@ class CodeSearch:
         Returns:
             文件内容
         """
-        full_path = os.path.join(self.root_path, file_path)
+        full_path = self._resolve_full_path(file_path)
         if not os.path.exists(full_path):
             return ""
         
@@ -157,6 +157,42 @@ class CodeSearch:
                 return f.read()
         except Exception:
             return ""
+
+    def _resolve_full_path(self, file_path: str) -> str:
+        """Resolve a user/tool provided path into an OS path under root_path.
+
+        Accepts:
+        - absolute paths
+        - root-relative paths like "src/app.py"
+        - paths prefixed with the root folder name like "<root>/src/app.py"
+        - common diff prefixes like "a/" and "b/"
+        """
+        path = str(file_path or "").strip()
+        if not path:
+            return path
+
+        path = path.replace("\\", "/")
+        if path.startswith("./"):
+            path = path[2:]
+        if path.startswith("a/") or path.startswith("b/"):
+            path = path[2:]
+
+        if os.path.isabs(path):
+            return path
+
+        root_abs = os.path.abspath(self.root_path)
+        root_base = os.path.basename(root_abs)
+
+        candidates = [path]
+        if path.startswith(root_base + "/"):
+            candidates.append(path[len(root_base) + 1 :])
+
+        for rel in candidates:
+            full = os.path.join(self.root_path, rel)
+            if os.path.exists(full):
+                return full
+
+        return os.path.join(self.root_path, candidates[0])
     
     def search_in_range(self, file_path: str, pattern: str, 
                         start_line: int, end_line: int) -> List[SearchResult]:
@@ -173,7 +209,7 @@ class CodeSearch:
             搜索结果
         """
         results = []
-        full_path = os.path.join(self.root_path, file_path)
+        full_path = self._resolve_full_path(file_path)
         
         if not os.path.exists(full_path):
             return results

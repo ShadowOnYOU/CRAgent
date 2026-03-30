@@ -297,7 +297,7 @@ index 0000000..1111111 100644
                     issue_type="逻辑错误",
                     severity=RiskLevel.MEDIUM,
                     message="return 行可能有问题",
-                    file_path=file_path,
+                    file_path=f"{os.path.basename(tmpdir)}/{file_path}",
                     line_number=3,
                     evidence=["return x"],
                     confidence=0.9,
@@ -374,6 +374,33 @@ index 0000000..1111111 100644
     print("  ✅ 事实校验过滤通过：仅保留可定位且证据可复现的问题")
     return True
 
+
+def test_l1_checklist_injection():
+    """测试 L1 Checklist 注入（不依赖 API Key）"""
+    print("=" * 50)
+    print("测试 L1 Checklist 注入...\n")
+
+    from context_engine.checklist import ChecklistInjector
+    from models import Context
+
+    agent_system_dir = os.path.dirname(os.path.abspath(__file__))
+
+    injector = ChecklistInjector(
+        root_path=agent_system_dir,
+        checklist_path="./config/checklist.json",
+    )
+
+    ctx = injector.inject(None)
+    assert ctx.checklist, "期望注入后 checklist 非空"
+
+    # 不应覆盖已有 checklist
+    original = Context(checklist=["已有规则"])
+    ctx2 = injector.inject(original)
+    assert ctx2.checklist == ["已有规则"], "不应覆盖已有 checklist"
+
+    print(f"  ✅ Checklist 注入成功：{len(ctx.checklist)} 条规则")
+    return True
+
 def main():
     """主函数"""
     print("\n" + "=" * 60)
@@ -386,6 +413,7 @@ def main():
         ("工具模块", test_tools),
         ("过滤器", test_filter),
         ("过滤器事实校验", test_filter_fact_checks),
+        ("L1 Checklist 注入", test_l1_checklist_injection),
         ("反馈模块", test_feedback),
         ("简单评审", test_simple_review),
     ]

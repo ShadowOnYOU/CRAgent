@@ -337,9 +337,38 @@ class ToolAgent:
                     error="file_path and positive line_number are required",
                 )
 
-            full_path = file_path
-            if not os.path.isabs(full_path):
-                full_path = os.path.join(self.root_path, file_path)
+            def resolve_full_path(p: str) -> str:
+                p = str(p or "").strip()
+                if not p:
+                    return p
+
+                # Normalize common diff/tool prefixes.
+                p = p.replace("\\", "/")
+                if p.startswith("./"):
+                    p = p[2:]
+                if p.startswith("a/") or p.startswith("b/"):
+                    p = p[2:]
+
+                if os.path.isabs(p):
+                    return p
+
+                root_abs = os.path.abspath(self.root_path)
+                root_base = os.path.basename(root_abs)
+                candidates = [p]
+
+                # Some tools return paths like "<root_base>/src/..."; strip it.
+                if p.startswith(root_base + "/"):
+                    candidates.append(p[len(root_base) + 1 :])
+
+                for rel in candidates:
+                    full = os.path.join(self.root_path, rel)
+                    if os.path.exists(full):
+                        return full
+
+                # Fall back to the most likely join (even if it doesn't exist) for error reporting.
+                return os.path.join(self.root_path, candidates[0])
+
+            full_path = resolve_full_path(file_path)
             if not os.path.exists(full_path):
                 return ToolResult(
                     tool_name="get_function_context",

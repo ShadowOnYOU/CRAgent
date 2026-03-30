@@ -28,3 +28,5 @@ data/
 # Sample project caches & generated outputs
 sample-lib/.pytest_cache/
 sample-lib/review_output_*.json
+sample-lib-2/.pytest_cache/
+sample-lib-2/review_output_*.json

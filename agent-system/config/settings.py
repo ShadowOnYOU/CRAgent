@@ -29,6 +29,8 @@ class ReviewConfig:
     max_context_tokens: int = 8000
     min_confidence: float = 0.6
     enable_tool_augmented: bool = True
+    enable_checklist: bool = True
+    checklist_path: str = "./config/checklist.json"
 
 
 @dataclass

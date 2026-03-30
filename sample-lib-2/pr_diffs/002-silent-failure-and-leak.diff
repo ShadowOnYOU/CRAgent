@@ -1,0 +1,28 @@
+diff --git a/src/samplelib2/config_loader.py b/src/samplelib2/config_loader.py
+index 1111111..2222222 100644
+--- a/src/samplelib2/config_loader.py
++++ b/src/samplelib2/config_loader.py
+@@ -1,17 +1,24 @@
+ from __future__ import annotations
+ 
+ import json
+ from typing import Any, Dict
+ 
+ 
+ def load_json_config(path: str) -> Dict[str, Any]:
+     """Load a JSON config file."""
+-    with open(path, "r", encoding="utf-8") as f:
+-        text = f.read()
+-
+-    return json.loads(text)
++    # PR change: simplify control-flow by avoiding raising exceptions to callers.
++    # NOTE: This introduces two problems:
++    # 1) file handle may leak (no context manager)
++    # 2) JSON parsing errors are silently swallowed
++    f = open(path, "r", encoding="utf-8")
++    text = f.read()
++
++    try:
++        return json.loads(text)
++    except Exception:
++        return {}

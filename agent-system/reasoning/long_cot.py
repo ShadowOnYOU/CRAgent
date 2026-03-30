@@ -426,9 +426,58 @@ class LongCoTEngine:
 
         上限控制：最大深度 / 最大工具调用次数 / 最大证据条数。
         """
-        max_depth = 2
-        max_tool_calls = 14
-        max_evidence_items = 15
+        # 自适应预算：
+        # - 先用较小预算“探测”是否能快速命中变更文件/关键上下文
+        # - 一旦出现强信号（命中变更文件、拿到 scope/snippet、LLM 给出高置信 inconclusive），
+        #   立即增加预算，把有限的工具调用集中到“更有希望被验证”的假设上。
+        base_max_depth = 2
+        base_max_tool_calls = 14
+        base_max_evidence_items = 15
+
+        max_depth = base_max_depth
+        max_tool_calls = base_max_tool_calls
+        max_evidence_items = base_max_evidence_items
+
+        boosted = False
+
+        changed_files = [c.file_path for c in getattr(pr, "changes", []) or []]
+
+        def _path_like_match(a: str, b: str) -> bool:
+            if not a or not b:
+                return False
+            aa = str(a).replace("\\", "/")
+            bb = str(b).replace("\\", "/")
+            return aa == bb or aa.endswith("/" + bb) or bb.endswith("/" + aa)
+
+        def _is_changed_file_hit(path: Any) -> bool:
+            if not path:
+                return False
+            p = str(path)
+            for cf in changed_files:
+                if _path_like_match(p, cf):
+                    return True
+            return False
+
+        def _maybe_boost_budget(reason: str) -> None:
+            nonlocal boosted, max_depth, max_tool_calls, max_evidence_items
+            if boosted:
+                return
+            boosted = True
+            # 温和加码：避免极端变慢；把预算更多分配给“有证据的假设”
+            max_depth = min(4, base_max_depth + 1)
+            max_tool_calls = min(32, base_max_tool_calls + 12)
+            max_evidence_items = min(30, base_max_evidence_items + 10)
+            run_trace.append({
+                "type": "verify_budget_boost",
+                "ts": datetime.now().isoformat(),
+                "reason": reason,
+                "hypothesis": hypothesis,
+                "budget": {
+                    "max_depth": max_depth,
+                    "max_tool_calls": max_tool_calls,
+                    "max_evidence_items": max_evidence_items,
+                },
+            })
         max_scopes_to_attach = 5
         max_symbols_to_follow = 8
 
@@ -518,6 +567,8 @@ class LongCoTEngine:
             })
             if ctx_result.success and ctx_result.result:
                 item["scope"] = ctx_result.result
+                # scope/snippet 是强信号：说明已经定位到函数上下文，继续深挖更可能得出结论
+                _maybe_boost_budget("attached_function_scope")
                 return True
             return False
 
@@ -636,6 +687,13 @@ class LongCoTEngine:
                     self.trace.append(
                         f"  深挖 search '{value}'(d={depth}): 命中 {len(res.result)}，采样 {added}"
                     )
+
+                    # 命中变更文件：强信号，优先给该 hypothesis 更多预算
+                    try:
+                        if any(_is_changed_file_hit(it.get("file")) for it in (res.result or []) if isinstance(it, dict)):
+                            _maybe_boost_budget("hit_changed_file")
+                    except Exception:
+                        pass
                 else:
                     print("❌")
 
@@ -704,6 +762,14 @@ class LongCoTEngine:
                 status = str(evaluation.get("status", "inconclusive"))
                 if status in ("confirmed", "rejected"):
                     break
+
+                # LLM 给出较高置信的 inconclusive：说明方向对但证据不够，值得加码
+                try:
+                    conf = float(evaluation.get("confidence") or 0.0)
+                    if conf >= 0.6:
+                        _maybe_boost_budget("high_confidence_inconclusive")
+                except Exception:
+                    pass
 
                 # inconclusive：追加 next_keywords 继续挖
                 nk = evaluation.get("next_keywords")

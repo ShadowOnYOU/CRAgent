@@ -51,7 +51,7 @@ class ReviewFilter:
         self,
         result: ReviewResult,
         min_severity: RiskLevel = RiskLevel.LOW,
-        min_confidence: float = 0.5,
+        min_confidence: float = 0.3,
         pr: Optional[PR] = None,
         root_path: Optional[str] = None,
         strict_facts: bool = False,
@@ -100,9 +100,9 @@ class ReviewFilter:
                 continue
             
             # 检查置信度
-            # 这边筛选的概率太高，暂时删除
-            # if issue.confidence < min_confidence:
-            #     continue
+            # 仅在 strict_facts 模式启用：让“降级置信度”真正触发剔除
+            if strict_facts and issue.confidence < min_confidence:
+                continue
             
             # 检查是否为低价值问题
             if self._is_low_value(issue):
@@ -283,6 +283,19 @@ class ReviewFilter:
         while p.startswith("./"):
             p = p[2:]
 
+        # 若模型返回的路径包含 root 目录名前缀（如 sample-lib/src/...），则剥掉该前缀
+        if root_path:
+            try:
+                abs_root = os.path.abspath(root_path)
+                root_name = os.path.basename(abs_root.rstrip(os.sep))
+                if root_name and p.startswith(root_name + "/"):
+                    candidate = p[len(root_name) + 1 :]
+                    # 仅当 candidate 在 root 下确实存在时才采用，避免误剥
+                    if os.path.exists(os.path.join(abs_root, candidate)):
+                        p = candidate
+            except Exception:
+                pass
+
         if p.startswith("a/") or p.startswith("b/"):
             p = p[2:]
 
@@ -385,6 +398,12 @@ class ReviewFilter:
             ln = ln.strip()
             if not ln:
                 continue
+
+            # 常见工具输出形态："path:line | code" —— 只取 code 部分用于复现匹配
+            if "|" in ln:
+                ln = ln.split("|", 1)[1].strip()
+                if not ln:
+                    continue
             # 去掉 diff/markdown 常见前缀
             ln = ln.lstrip("+- ")
             if len(ln) < 6:

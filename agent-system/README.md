@@ -98,6 +98,11 @@ python main.py
 python main.py --diff changes.diff --title "Fix bug in user module"
 ```
 
+提示：你可以在任意工作目录运行（如在 `agent-system/` 内），CLI 会尽量自动补全路径：
+
+- `--root sample-lib-2` + `--diff 002-xxx.diff` 会自动尝试在 `<root>/pr_diffs/` 下寻找 diff
+- `--output sample-lib-2/review.json` 会相对仓库根目录写出，并自动创建父目录
+
 ## 🧪 测试
 
 本项目提供两类测试：
@@ -161,6 +166,39 @@ python main.py \
   --title "SampleLib: Introduce cache bug" \
   --output ../sample-lib/review_output.json
 ```
+
+## ▶️ 跑 sample-lib-2 示例（演示 strict_facts + evidence 可复现）
+
+`sample-lib-2/` 是第二套端到端用例：它故意引入“文件未关闭 + 静默吞错”等问题，便于验证 strict_facts 的效果。
+
+你可以在 `agent-system/` 目录直接运行（不需要写 `../`）：
+
+```bash
+cd agent-system
+export DASHSCOPE_API_KEY=your_api_key_here
+
+python main.py \
+  --root sample-lib-2 \
+  --diff 002-silent-failure-and-leak.diff \
+  --title "sample-lib-2 002" \
+  --output sample-lib-2/review_output_002.json
+```
+
+如果你想对比“过滤前”的原始输出（便于诊断为何被 strict_facts 过滤为 0），加 `--no-filter`：
+
+```bash
+python main.py --root sample-lib-2 --diff 002-silent-failure-and-leak.diff --no-filter
+```
+
+## 🧹 关于 strict_facts（为什么看起来过滤很狠）
+
+默认启用 `strict_facts=True`，会对每条 issue 做事实强约束：
+
+- `file_path` 必须能归一化到 root 内的相对路径
+- `line_number` 必须能在文件或 diff hunk 中定位
+- `evidence` 必须能在“文件内容 / PR diff / new_content”里复现匹配（匹配不到会降级置信度并通常被阈值剔除）
+
+因此更推荐让 CONCLUDE 输出的 evidence 尽量贴近真实代码行（例如 `path:line | code` 这种形式），以减少误杀。
 
 ## 📖 使用示例
 

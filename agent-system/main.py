@@ -21,6 +21,7 @@ from reasoning.long_cot import LongCoTEngine
 from judge.filter import ReviewFilter
 from feedback.loop import FeedbackLoop
 from ingestion.pr_parser import PRParser
+from context_engine.checklist import ChecklistInjector
 
 
 class CodeReviewAgent:
@@ -43,6 +44,11 @@ class CodeReviewAgent:
         self.pr_parser = PRParser()
         self.review_filter = ReviewFilter(self.llm_client)
         self.feedback_loop = FeedbackLoop()
+        # L1：Checklist 注入（最小实现）
+        self.checklist_injector = ChecklistInjector(
+            root_path=os.path.dirname(os.path.abspath(__file__)),
+            checklist_path=getattr(config.review, "checklist_path", "./config/checklist.json"),
+        )
         
         # 根据模式选择推理引擎
         if use_long_cot:
@@ -65,6 +71,10 @@ class CodeReviewAgent:
         """
         print(f"开始评审 PR: {pr.title}")
         print(f"变更文件数：{len(pr.changes)}")
+
+        # L1：注入自定义 Checklist（业务/工程规则）
+        if getattr(config.review, "enable_checklist", True):
+            context = self.checklist_injector.inject(context, pr=pr)
         
         # 执行推理
         if self.use_long_cot:
@@ -91,8 +101,13 @@ class CodeReviewAgent:
         
         return result
     
-    def review_diff(self, diff_text: str, pr_title: str = "Untitled",
-                    pr_description: str = "") -> ReviewResult:
+    def review_diff(
+        self,
+        diff_text: str,
+        pr_title: str = "Untitled",
+        pr_description: str = "",
+        enable_filter: bool = True,
+    ) -> ReviewResult:
         """
         直接评审 diff 文本
         
@@ -115,7 +130,7 @@ class CodeReviewAgent:
             changes=changes
         )
         
-        return self.review_pr(pr)
+        return self.review_pr(pr, enable_filter=enable_filter)
     
     def review_file_changes(self, file_path: str, old_content: str, 
                             new_content: str, pr_title: str = "") -> ReviewResult:
@@ -197,6 +212,67 @@ def main():
     parser.add_argument("--output", "-o", help="输出结果文件路径")
     
     args = parser.parse_args()
+
+    def _resolve_root_path(root_path: str) -> str:
+        root_path = str(root_path or ".").strip() or "."
+        if os.path.isabs(root_path) and os.path.exists(root_path):
+            return root_path
+        if os.path.exists(root_path):
+            return os.path.abspath(root_path)
+        # 兼容在 agent-system/ 目录内运行：把相对路径按项目根目录尝试一次
+        project_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
+        candidate = os.path.join(project_root, root_path)
+        if os.path.exists(candidate):
+            return os.path.abspath(candidate)
+        return os.path.abspath(root_path)
+
+    def _resolve_diff_path(diff_path: str, resolved_root: str) -> str:
+        diff_path = str(diff_path or "").strip()
+        if not diff_path:
+            return diff_path
+
+        # 1) 原样（相对 cwd）
+        if os.path.exists(diff_path):
+            return os.path.abspath(diff_path)
+
+        # 2) 绝对路径
+        if os.path.isabs(diff_path):
+            return diff_path
+
+        project_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
+
+        # 3) 常见位置：<root>/pr_diffs/<name> 或 <root>/<name>
+        if resolved_root and os.path.exists(resolved_root):
+            for cand in (
+                os.path.join(resolved_root, diff_path),
+                os.path.join(resolved_root, "pr_diffs", diff_path),
+                os.path.join(resolved_root, "tests", "pr_diffs", diff_path),
+            ):
+                if os.path.exists(cand):
+                    return os.path.abspath(cand)
+
+        # 4) 项目根相对路径
+        for cand in (
+            os.path.join(project_root, diff_path),
+            os.path.join(project_root, "pr_diffs", diff_path),
+        ):
+            if os.path.exists(cand):
+                return os.path.abspath(cand)
+
+        return diff_path
+
+    def _resolve_output_path(output_path: str) -> str:
+        output_path = str(output_path or "").strip()
+        if not output_path:
+            return output_path
+        if os.path.isabs(output_path):
+            return output_path
+        if os.path.exists(os.path.dirname(output_path) or "."):
+            return os.path.abspath(output_path)
+
+        project_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
+        candidate = os.path.join(project_root, output_path)
+        return os.path.abspath(candidate)
     
     # 检查 API Key
     if not os.getenv("DASHSCOPE_API_KEY"):
@@ -204,14 +280,16 @@ def main():
         print("   export DASHSCOPE_API_KEY=your_api_key")
         sys.exit(1)
     
+    resolved_root = _resolve_root_path(args.root)
     # 创建 Agent
-    agent = CodeReviewAgent(root_path=args.root, use_long_cot=not args.simple)
+    agent = CodeReviewAgent(root_path=resolved_root, use_long_cot=not args.simple)
     
     # 读取 diff
     if args.diff:
-        with open(args.diff, 'r', encoding='utf-8') as f:
+        diff_file = _resolve_diff_path(args.diff, resolved_root)
+        with open(diff_file, 'r', encoding='utf-8') as f:
             diff_text = f.read()
-        result = agent.review_diff(diff_text, args.title)
+        result = agent.review_diff(diff_text, args.title, enable_filter=not args.no_filter)
     else:
         # 演示模式：创建示例 PR
         print("未指定 diff 文件，进入演示模式...")
@@ -243,7 +321,11 @@ def main():
     
     # 保存到文件
     if args.output:
-        with open(args.output, 'w', encoding='utf-8') as f:
+        output_file = _resolve_output_path(args.output)
+        out_dir = os.path.dirname(output_file)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(output_file, 'w', encoding='utf-8') as f:
             json.dump({
                 "summary": result.summary,
                 "reasoning_trace": result.reasoning_trace,
@@ -260,7 +342,7 @@ def main():
                     for i in result.issues
                 ]
             }, f, ensure_ascii=False, indent=2)
-        print(f"\n结果已保存到：{args.output}")
+        print(f"\n结果已保存到：{output_file}")
 
 
 if __name__ == "__main__":
